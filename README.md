@@ -3,14 +3,16 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6)
 ![Requires](https://img.shields.io/badge/requires-WSL%202-blue)
 ![Status](https://img.shields.io/badge/status-unofficial-orange)
-![Version](https://img.shields.io/badge/version-2.3-green)
+![Version](https://img.shields.io/badge/version-4.1_stable-brightgreen)
 
 Try the **Flipper One** user interface on any Windows PC - no device, no extra hardware, no manual setup.
 
-A single double-click on `FlipperEmulator 2.3.bat` downloads everything it needs, sets up an isolated Linux environment, and lets you choose between two modes:
+A single double-click on `FlipperEmulator 4.1.bat` downloads everything it needs, sets up an isolated Linux environment, and lets you choose between two modes:
 
 - **FlipCTL preview** - the fast, stable test UI from the Flipper One image. Hardware features are simulated.
 - **Real Flipper OS** - the actual Flipper OS kernel and initramfs, booted in QEMU (aarch64) on your PC. Experimental.
+
+> **Stable helper, experimental emulation:** 4.1 is the stable release of this Windows helper. The real-OS mode itself remains experimental because QEMU emulates hardware the image was not built for.
 
 > **Disclaimer:** This is an unofficial community project. It is **not** affiliated with or endorsed by Flipper Devices. This repository contains no Flipper software - the helper only downloads publicly available components from their official sources.
 
@@ -23,6 +25,7 @@ A single double-click on `FlipperEmulator 2.3.bat` downloads everything it needs
 - [Quick Start](#quick-start)
 - [Usage](#usage)
 - [Real Flipper OS Mode](#real-flipper-os-mode)
+- [Internet Access (NAT)](#internet-access-nat)
 - [How It Works](#how-it-works)
 - [What Gets Installed](#what-gets-installed)
 - [Uninstalling](#uninstalling)
@@ -30,7 +33,10 @@ A single double-click on `FlipperEmulator 2.3.bat` downloads everything it needs
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 - [Security Note](#security-note)
-- [Version 2.3](#version-23)
+- [Version 4.1 (stable release)](#version-41-stable-release)
+- [Version 4.0 (previous test build)](#version-40-previous-test-build)
+- [Version 3.0 (test build)](#version-30-test-build)
+- [Version 2.3 (previous stable release)](#version-23-previous-stable-release)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -59,7 +65,7 @@ The real-OS mode boots the actual Flipper OS kernel and initramfs from the publi
 | **OS** | 64-bit Windows 10 or Windows 11 |
 | **WSL 2** | Windows Subsystem for Linux 2. The helper installs it if it is missing. |
 | **Virtualization** | Must be enabled in the BIOS/UEFI for WSL 2. |
-| **Browser** | Microsoft Edge or Google Chrome recommended. One of them is used for the hidden device renderer. The real OS opens in your default browser. |
+| **Browser** | Microsoft Edge or Google Chrome recommended. Both modes open in your default browser; one of Edge/Chrome is additionally used as a hidden device renderer for the preview. |
 | **Disk space** | Plan for about 12 GB free during setup. The finished installation uses about 8-9 GB. |
 | **Internet** | Required for setup and reinstall. Normal use works offline. |
 | **RAM** | 8 GB recommended for the real OS. The preview runs on less. |
@@ -69,7 +75,7 @@ The real-OS mode boots the actual Flipper OS kernel and initramfs from the publi
 
 ## Quick Start
 
-1. **Download** `FlipperEmulator 2.3.bat` from the `Public Releases` folder.
+1. **Download** `FlipperEmulator 4.1.bat` from the `Public Releases` folder. This is the stable release. Older versions remain available in `Public Releases` and `DevBuilds`.
 2. **Double-click** the file. You can keep it anywhere; the helper installs its own copy.
 3. **Wait** while the first-time setup runs. It downloads several GB and may take a while.
 4. When the menu appears, choose **1** for the FlipCTL preview or **2** for the real Flipper OS. Pressing **Enter** starts the preview.
@@ -101,8 +107,8 @@ After setup, running the file shows a simple menu:
 | **1** | Starts the FlipCTL preview server and opens the UI in your browser. |
 | **2** | Boots the real Flipper OS in QEMU and opens it in your browser. |
 | **3** | Stops the preview server, the hidden device browser and QEMU. |
-| **4** | Removes the private Linux environment, all downloaded files, QEMU, settings and shortcuts. |
-| **5** | Performs a full uninstall and a fresh automatic reinstall. It restores the mode you used last. |
+| **4** | Removes the private Linux environment, all downloaded files, portable QEMU, settings and shortcuts. |
+| **5** | Performs a full uninstall and a fresh automatic reinstall. It restores the real Flipper OS if you used it before; otherwise the FlipCTL preview. |
 | **6** | Shows the last lines of the preview server log. |
 | **7** | Closes the menu. A running preview or real OS keeps running in the background. |
 
@@ -118,7 +124,7 @@ On the first successful setup, three shortcuts are created under **Flipper One D
 
 ### Command-line arguments
 
-The helper can also be run non-interactively:
+The helper also accepts these command-line arguments:
 
 | Argument | Action |
 |---|---|
@@ -129,15 +135,17 @@ The helper can also be run non-interactively:
 | `uninstall` | Remove everything without asking for confirmation. |
 | `qemu` | Download and prepare the portable QEMU emulator. |
 | `install` | Set up or repair the installation without starting the app. |
-| `reinstall` | Full uninstall and fresh setup, then restore the last used mode. |
+| `reinstall` | Full uninstall and fresh setup, then restore the real Flipper OS if it was used before; otherwise the FlipCTL preview. |
 | `resume` | Internal one-time resume after a required Windows restart. |
+
+`start` and `real` still show the final "press S or Enter" prompt; use **[3] Stop everything** or the `stop` argument to stop the app. `stop`, `log`, `uninstall`, `qemu` and `install` run without prompts; `reinstall` still asks for the YES confirmation.
 
 Example:
 
 ```bat
-FlipperEmulator 2.3.bat start
-FlipperEmulator 2.3.bat real
-FlipperEmulator 2.3.bat stop
+FlipperEmulator 4.1.bat start
+FlipperEmulator 4.1.bat real
+FlipperEmulator 4.1.bat stop
 ```
 
 ### Stopping the app
@@ -157,12 +165,44 @@ Closing the console window or choosing **[7] Exit** does not stop a running inst
 The real-OS mode is experimental. It boots the actual Flipper OS kernel and initramfs from the public image, with the image's root filesystem mounted read-write.
 
 - **Emulation:** QEMU `virt` machine with a Cortex-A72 CPU and TCG software emulation. No ARM hardware is required.
+- **Internet:** automatic. The guest uses QEMU user-mode networking (NAT), receives `10.0.2.15` by DHCP and can reach the host at `10.0.2.2`, DNS at `10.0.2.3` and the internet. Nothing has to be configured, inside or outside the guest.
 - **Memory/CPU:** The helper sizes QEMU to your PC (2-4 GB RAM, up to 4 vCPUs).
 - **First start:** Usually 1-3 minutes. Slower PCs may take longer. The helper waits up to 7 minutes before showing a warning.
+- **One-time network setup:** On the first real-OS start, the helper adds the DHCP profile to the image. This takes about 10 seconds; keep the console window open until that step has finished. If it is interrupted, the next start safely retries.
 - **URL:** `http://127.0.0.1:8899/` by default. If port 8899 is busy, the helper picks the next free local port and opens it automatically.
 - **Persistence:** The raw image is writable, so changes made inside the emulated OS persist until you reinstall.
+- **Installed apps:** Apps installed in the image can be started from the Apps page or the in-OS App Manager. Doom, for example, starts and renders on the emulated panel. Starting a hosted app can take a few minutes under software emulation.
+- **App rendering:** QEMU has no GPU, so hosted apps use SDL's software renderer and a software compositor. Apps that require a real GPU may still not work.
 - **Hardware:** Wi-Fi, modem, battery, GPIO and other physical features are not available. Errors about missing hardware are expected.
 - **QEMU source:** If a system QEMU is already installed, it is reused. Otherwise a portable QEMU is downloaded and unpacked under the app folder. No administrator rights are needed.
+
+---
+
+## Internet Access (NAT)
+
+The real Flipper OS runs with internet access out of the box. QEMU provides user-mode networking (NAT), so no network bridge, no administrator rights and no Windows firewall rule are required.
+
+| From the guest | Address | Meaning |
+|---|---|---|
+| Guest IP | `10.0.2.15` (DHCP) | Assigned automatically by QEMU |
+| Gateway / host | `10.0.2.2` | The Windows PC that runs QEMU |
+| DNS | `10.0.2.3` | QEMU's DNS forwarder |
+| Internet | any | TCP/UDP and ICMP are forwarded through the host |
+
+How it works:
+
+- QEMU starts with `-netdev user,id=net0` and a `virtio-net` adapter with a fixed MAC address.
+- The first time the real OS starts, the helper adds one small file to the image: `/etc/systemd/network/10-qemu-nat.network`. It matches only the `virtio_net` driver, so real Rockchip hardware is never affected. The file is written to a temporary name first and then renamed, so an interrupted write cannot leave a half-written profile.
+- On every boot, `systemd-networkd` applies that profile, requests an address by DHCP and passes gateway and DNS to the system.
+- The profile is stored in the image, so it survives reboots. A reinstall re-creates it automatically.
+- The helper writes it only once. If the write fails or is interrupted, the image keeps its previous behaviour, the built-in DHCP fallback still works and the next start retries.
+
+Notes:
+
+- **Outbound only.** The guest can reach the internet and the Windows host. Incoming connections are not forwarded, except the UI port that the helper publishes on `127.0.0.1`.
+- `10.0.2.2` is the **Windows host**, not the WSL distribution. WSL has its own virtual network behind Windows.
+- Wi-Fi, modem and Bluetooth errors in the guest log are expected: that hardware does not exist in QEMU. They do not block the boot and do not affect internet access.
+- The `stun.services.mozilla.com` messages in the flipctl log are harmless: that hostname no longer exists.
 
 ---
 
@@ -173,8 +213,9 @@ The real-OS mode is experimental. It boots the actual Flipper OS kernel and init
 3. **Image download and decompression** - downloads the public Flipper One image (about 2 GB compressed) and decompresses it to a raw image of about 6 GB with portable zstd. The compressed download is deleted afterwards; the raw image is kept because the real-OS mode needs it.
 4. **Extraction** - mounts the image read-only inside the private WSL distribution and extracts the FlipCTL preview UI, the kernel and the initramfs.
 5. **Preview setup** - installs Node.js inside the private environment, runs the FlipCTL test server on port 8899 and starts a hidden Edge/Chrome instance that identifies itself like the device browser.
-6. **Real-OS setup** - uses an existing system QEMU or prepares the portable QEMU. It then boots the extracted kernel and initramfs with the raw image, forwards a localhost port to the guest and waits for the web UI.
-7. **Browser** - opens the preview or the real OS in your normal browser. Everything runs locally; no cloud service is involved.
+6. **Network profile** - on the first real-OS start, mounts the image read-write once and adds a matching `systemd-networkd` DHCP profile for the QEMU network adapter. The file is replaced atomically, the write is idempotent and only the `@Minimal` subvolume is touched.
+7. **Real-OS setup** - uses an existing system QEMU or prepares the portable QEMU. It then boots the extracted kernel and initramfs with the raw image, forwards a localhost port to the guest and waits for the web UI.
+8. **Browser** - opens the preview or the real OS in your normal browser. Everything runs locally; no cloud service is involved.
 
 ---
 
@@ -183,7 +224,7 @@ The real-OS mode is experimental. It boots the actual Flipper OS kernel and init
 | Component | Purpose | Source |
 |---|---|---|
 | Flipper One Linux image (about 2 GB compressed, about 6 GB raw) | Preview UI and real-OS filesystem | `dl-linux-images.flipp.dev` |
-| Ubuntu 24.04 WSL base system (about 350 MB) | Private Linux environment | `cloud-images.ubuntu.com` |
+| Ubuntu 24.04 WSL base system (about 350 MB download) | Private Linux environment | `cloud-images.ubuntu.com` |
 | Node.js 22.11.0 | Preview server | `nodejs.org` |
 | zstd 1.5.7 | Decompress the Flipper One image | GitHub (`meta/zstd`) |
 | 7-Zip 23.01 | Unpack the portable QEMU installer | `7-zip.org` |
@@ -256,7 +297,10 @@ You can switch modes at any time with **[1]** and **[2]**.
 | **Blank preview page or server not responding** | Choose **[6] Show server log**, or try **[5] Reinstall**. |
 | **Port 8899 is busy** | Close the program using port 8899. The preview needs this port. The real-OS mode chooses the next free port automatically. |
 | **Real Flipper OS does not boot** | Wait up to 7 minutes. Check `%LOCALAPPDATA%\FlipperOneDemo\realos\serial.log` and `qemu.err.log`. The image is built for RK3576 hardware; emulation may not work on every PC. Try **[5] Reinstall**. |
-| **QEMU download fails** | If a system QEMU is installed, it is used automatically. Otherwise check your connection and run `FlipperEmulator 2.3.bat qemu` to retry the portable download. |
+| **An app does not appear in the real OS** | Wait a few minutes: software emulation is slow, and Doom in particular takes time to mount and start. Then try the app again from the Apps page or the in-OS App Manager. Apps that need a real GPU may not work. |
+| **No internet in the real OS** | Close and start the real OS again. On the first start, wait for the one-time network profile to finish (about 10 seconds) and keep the console window open. Inside the guest, `10.0.2.2` is the Windows host and `10.0.2.3` is DNS. If a reinstall also fails, include the last lines of `qemu.err.log` in an issue. |
+| **Ping fails but websites load** | Windows may block QEMU's ICMP forwarding on some systems. TCP and DNS still work, so the guest has internet. Test with a browser or a normal download. |
+| **QEMU download fails** | If a system QEMU is installed, it is used automatically. Otherwise check your connection and run `FlipperEmulator 4.1.bat qemu` to retry the portable download. |
 | **No browser found** | Install Microsoft Edge or Google Chrome. The preview needs one of them for the hidden device renderer. |
 | **Uninstall leaves files behind** | Close all browser windows and retry. If the private WSL distribution is busy, restart Windows and run uninstall again. |
 | **Antivirus blocks a download** | The helper downloads large tools from official sources. Allow the files after checking them, then retry. |
@@ -272,6 +316,7 @@ If the problem persists, open an issue and include the output of **[6] Show serv
 - The real OS is built for a Rockchip RK3576 board. Some image versions may change the internal structure and require an update of this helper.
 - The helper requires WSL 2 and virtualization. It is not available on systems where virtualization is disabled or unsupported.
 - The real-OS image is writable. Changes persist locally until you reinstall.
+- Internet access in the real OS is **outbound only** (QEMU user-mode NAT). The guest is not reachable from your local network.
 
 ---
 
@@ -288,15 +333,81 @@ As with any script from the internet, **please read it before you run it**.
 
 ---
 
-## Version 2.3
+## Version 4.1 (stable release)
 
-Version **2.3** is the current release. It includes:
+Version **4.1** is the stable release. It keeps both modes and all features of 4.0, with a safer and clearer one-time network setup:
+
+- fully automatic internet access in the real Flipper OS through QEMU user-mode networking (NAT)
+- the network profile is written atomically, so closing the window during the one-time setup cannot leave a half-written profile
+- a clearer first-start message: the network step takes about 10 seconds and the console window must stay open until it finishes
+- the installed copy now records the helper version in `installed.flag` while keeping the original installation date
+- no changes to the preview, the app launcher or the QEMU/host networking setup
+
+Verified before release:
+
+- complete fresh installation from an empty state, including WSL import, image download, decompression and first boot
+- complete reinstall through option 5, including a fresh image download and automatic re-application of the network profile
+- option 4 (uninstall) removes the private environment, files and Start menu shortcuts again
+- real boot: `eth0` uses `10-qemu-nat.network`, receives `10.0.2.15/24`, gateway `10.0.2.2` and DNS `10.0.2.3`; ICMP, DNS resolution and HTTP all work
+- Doom starts from the App Manager, renders on the emulated panel and runs under software emulation
+- the FlipCTL preview still starts, responds and stops cleanly
+- upgrading an existing 4.0 image keeps the installed apps and does not rewrite the network profile
+- `btrfs check --readonly` reports no errors after the tests
+
+The `Public Releases` folder contains:
+
+- `FlipperEmulator 4.1.bat` - stable release
+- `FlipperEmulator 3.0.bat` - public test build
+- `FlipperEmulator 2.3.bat` - previous stable release
+- `FlipperEmulator 1.0.bat` - legacy release
+
+The `DevBuilds` folder keeps every build, including the 4.1 source and the previous 4.0 test build. Older files are not modified by the helper.
+
+---
+
+## Version 4.0 (previous test build)
+
+Version **4.0** was the test build that introduced fully automatic internet access to the real Flipper OS:
+
+- QEMU user-mode networking (NAT) with a virtio adapter and a fixed MAC address
+- automatic DHCP on every boot through a persistent `systemd-networkd` profile
+- host reachable at `10.0.2.2`, DNS at `10.0.2.3`, internet through the Windows host
+- the profile is written into the image once, idempotently, and matches only `virtio_net`, so real hardware is unaffected
+- if the profile cannot be written, the image's built-in DHCP fallback keeps working
+
+The network mechanism in 4.0 is unchanged in 4.1. Version 4.0 remains available as a development test build:
+
+- `DevBuilds\FlipperEmulator 4.0.bat`
+
+---
+
+## Version 3.0 (test build)
+
+Version **3.0** is a public test build. It is based on 2.3 and makes installed apps work in the real Flipper OS mode. It includes:
+
+- installed apps can be started from the Apps page or the in-OS App Manager
+- Doom starts and renders on the emulated panel
+- a software SDL renderer for hosted apps, because QEMU has no GPU
+- a runtime-directory workaround for the missing logind seat in QEMU
+
+The workaround sets `XDG_RUNTIME_DIR` and the SDL renderer through the kernel command line. It does not modify the Flipper OS image, so the image stays compatible with the normal installer and with 2.3.
+
+Release files:
+
+- `Public Releases\FlipperEmulator 3.0.bat`
+- `DevBuilds\FlipperEmulator 3.0.bat`
+
+---
+
+## Version 2.3 (previous stable release)
+
+Version **2.3** is the previous stable release. It includes:
 
 - the stable FlipCTL preview and the experimental real Flipper OS mode
 - automatic WSL setup with one-time resume after a required restart
 - automatic portable QEMU setup without administrator rights
 - complete uninstall and fully automatic reinstall
-- automatic restoration of the last used mode after a reinstall
+- automatic restoration of the real-OS mode after a reinstall if it was used before
 - refreshed installed copy and Start menu shortcuts when starting either mode
 
 Version 2.3 also fixes the reinstall failure when the helper is started from its installed copy, and the menu no longer loops when console input is closed.
@@ -304,9 +415,9 @@ Version 2.3 also fixes the reinstall failure when the helper is started from its
 Release files:
 
 - `Public Releases\FlipperEmulator 2.3.bat`
-- `Test Versions\FlipperEmulator 2.3.bat`
+- `DevBuilds\FlipperEmulator 2.3.bat`
 
-Older versions remain available and are not modified by the helper.
+Version 1.0 remains available in `Public Releases` and `DevBuilds` as a legacy release.
 
 ---
 
