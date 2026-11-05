@@ -1,0 +1,2671 @@
+@echo off
+setlocal
+title Flipper One Demo v5.0
+rem Flipper One Demo - unofficial community helper, v5.0 release build
+rem Option 1: FlipCTL preview. Option 2: real Flipper OS in QEMU (aarch64).
+rem Option 3: File Manager for your own files (runs alongside option 2).
+set "FLIP_BAT=%~f0"
+set "FLIP_ARGS=%*"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$f = Get-Content -LiteralPath $env:FLIP_BAT -Raw -Encoding UTF8; $i = $f.IndexOf('#PS1' + 'START'); Invoke-Expression $f.Substring($i)"
+exit /b %errorlevel%
+#PS1START
+# =============================================================================
+# Flipper One Demo - unofficial community helper (v5.0 release build)
+#
+# NOT affiliated with or endorsed by Flipper Devices.
+#
+# Option 1: FlipCTL preview UI (the test UI from the Flipper OS image).
+# Option 2: Boots the REAL Flipper OS kernel + initramfs in QEMU (aarch64).
+#           The image targets Rockchip RK3576 (ARM); hardware is emulated only.
+#           Real Wi-Fi, modem, battery, and GPIO are not available on a PC.
+#           The virtual machine gets automatic internet access through
+#           QEMU user-mode networking (NAT). Nothing has to be configured.
+# Option 3: File Manager for your own files. It works while the real Flipper
+#           OS is running, so files can be uploaded and tested immediately.
+#           Files live in /home/user/Files inside the Flipper OS and are backed
+#           up to %LOCALAPPDATA%\FlipperOneDemoFiles on this PC.
+#
+# Everything is installed automatically inside %LOCALAPPDATA%\FlipperOneDemo.
+# No administrator rights are required for the app or for QEMU.
+# Windows may ask once for permission to enable WSL.
+# Option 5 removes the emulator again. The latest files are copied to the PC
+# backup first, and a reinstall restores them automatically.
+# =============================================================================
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+
+$Version       = '5.0'
+$Root          = Join-Path $env:LOCALAPPDATA 'FlipperOneDemo'
+$DlDir         = Join-Path $Root 'dl'
+$DistroDir     = Join-Path $Root 'distro'
+$ToolsDir      = Join-Path $Root 'tools'
+$RealRoot      = Join-Path $Root 'realos'
+$QemuDir       = Join-Path $Root 'qemu'
+$QemuExe       = Join-Path $QemuDir 'qemu-system-aarch64.exe'
+$BootDir       = Join-Path $RealRoot 'boot'
+$Vmlinuz       = Join-Path $BootDir 'vmlinuz'
+$Initrd        = Join-Path $BootDir 'initrd'
+$RealRaw       = Join-Path $RealRoot 'flipper-os.img'
+$GuestNetFlag  = Join-Path $RealRoot 'net-v4.flag'
+$QemuPidFile   = Join-Path $Root 'qemu.pid'
+$ServerPidFile = Join-Path $Root 'server.pid'
+$InstalledFlag = Join-Path $Root 'installed.flag'
+$Distro        = 'FlipperOne'
+$Port          = 8899
+$Url           = "http://127.0.0.1:$Port/"
+$ShelfPort     = 8898
+$ShelfUrl      = "http://127.0.0.1:$ShelfPort/"
+$ShelfPortFile = Join-Path $RealRoot 'shelf.port'
+$AppPortFile   = Join-Path $RealRoot 'app.port'
+$ShelfFlag     = Join-Path $RealRoot 'shelf-v5.flag'
+$FilesMirror   = Join-Path $env:LOCALAPPDATA 'FlipperOneDemoFiles'
+$ImageUrl      = 'https://dl-linux-images.flipp.dev/full-img/2407/debian-512-sige5-2407.img.zst'
+$UbuntuBase    = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/'
+$NodeUrls      = @('https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz')
+$ZstdUrl       = 'https://github.com/meta/zstd/releases/download/v1.5.7/zstd-v1.5.7-win64.zip'
+$SevenZipMsiUrl = 'https://www.7-zip.org/a/7z2301-x64.msi'
+$SevenZipMsiSha256 = '0BA639B6DACDF573D847C911BD147C6384381A54DAC082B1E8C77BC73D58958B'
+$QemuIndex     = 'https://qemu.weilnetz.de/w64/'
+$QemuFallbacks = @('qemu-w64-setup-20260811.exe', 'qemu-w64-setup-20260805.exe', 'qemu-w64-setup-20260729.exe')
+$DeviceUA      = 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/605.1.15 (KHTML, like Gecko) Cog/0.18.4 WPE'
+$MenuDir       = Join-Path ([Environment]::GetFolderPath('Programs')) 'Flipper One Demo'
+$script:SelfSource = $env:FLIP_BAT
+$script:SelfBackup = $null
+$script:LastErr = ''
+
+$InstallScript = @'
+#!/bin/bash
+# Runs as root inside the private WSL distribution "FlipperOne".
+set -Eeuo pipefail
+RAW="${1:?Path to the raw image is missing}"
+BOOTOUT="${2:?Boot output path is missing}"
+NODE_TAR="${3:-}"
+MNT="/mnt/flipimg"
+LOOP=""
+KPARTX=0
+OFFLOOPS=()
+PARTS=()
+log()  { echo "==> $*"; }
+warn() { echo "!!  $*" >&2; }
+die()  { echo "XX  $*" >&2; exit 1; }
+cleanup() {
+  set +e
+  local d lp
+  for d in $(find "$MNT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r); do
+    umount "$d" 2>/dev/null || umount -l "$d" 2>/dev/null
+  done
+  for lp in "${OFFLOOPS[@]:-}"; do [ -n "$lp" ] && losetup -d "$lp" 2>/dev/null; done
+  [ "$KPARTX" = 1 ] && [ -n "$LOOP" ] && kpartx -d "$LOOP" >/dev/null 2>&1
+  [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+}
+trap cleanup EXIT
+
+log "Installing required packages"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y btrfs-progs util-linux kpartx rsync xz-utils fdisk e2fsprogs squashfs-tools ca-certificates curl zstd
+
+if [ -n "$NODE_TAR" ] && [ -f "$NODE_TAR" ]; then
+  log "Setting up Node.js"
+  mkdir -p /opt/node
+  tar -xJf "$NODE_TAR" -C /opt/node --strip-components=1
+else
+  log "Installing Node.js from the Ubuntu packages"
+  apt-get install -y nodejs
+  mkdir -p /opt/node/bin
+  ln -sf "$(command -v node)" /opt/node/bin/node
+fi
+/opt/node/bin/node --version
+
+log "Mounting the Flipper OS image (read-only)"
+mkdir -p "$MNT"
+LOOP="$(losetup -fP --show "$RAW")" || die "Loop devices are not available. Run 'wsl --update' in PowerShell and try again."
+sleep 1
+while IFS= read -r p; do [ -n "$p" ] && PARTS+=("$p"); done < <(ls -1 "${LOOP}"p* 2>/dev/null | sort -V || true)
+if [ "${#PARTS[@]}" -eq 0 ]; then
+  kpartx -avs "$LOOP" >/dev/null 2>&1 && KPARTX=1 || true
+  while IFS= read -r p; do [ -n "$p" ] && PARTS+=("$p"); done < <(ls -1 /dev/mapper/"$(basename "$LOOP")"p* 2>/dev/null | sort -V || true)
+fi
+[ "${#PARTS[@]}" -gt 0 ] || die "No partitions were found in the image."
+log "Partitions: ${PARTS[*]}"
+
+BTRFS=""
+n=0
+for p in "${PARTS[@]}"; do
+  n=$((n+1))
+  mkdir -p "$MNT/p$n"
+  if mount -o ro,subvolid=5 "$p" "$MNT/p$n" 2>/dev/null; then
+    if [ -d "$MNT/p$n/@Minimal" ]; then BTRFS="$MNT/p$n"; break; fi
+  else
+    rmdir "$MNT/p$n" 2>/dev/null || true
+  fi
+done
+[ -n "$BTRFS" ] || die "The Flipper OS root filesystem was not found in the image."
+
+log "Looking for the FlipCTL preview"
+SRC=""
+while IFS= read -r d; do
+  case "$d" in *stock-snapshots*) continue ;; esac
+  if [ -f "$d/server.js" ]; then SRC="$(dirname "$d")"; break; fi
+done < <(find "$BTRFS" -maxdepth 8 -type d -name fake-flipctl2 2>/dev/null | sort)
+[ -n "$SRC" ] || die "No fake-flipctl2 folder was found in the image."
+log "Found: $SRC"
+log "Copying the preview UI"
+mkdir -p /flipperone-testing
+rsync -a --delete "$SRC"/ /flipperone-testing/
+ln -sfn /flipperone-testing/fake-flipctl2 /flipperone-testing/active-flipctl
+[ -f /flipperone-testing/fake-flipctl2/server.js ] || die "server.js is missing after copying."
+
+log "Extracting the kernel and initramfs"
+KDIR="$(ls -1d "$BTRFS"/@Minimal/usr/lib/modules/*/ 2>/dev/null | sort -V | tail -n 1)"
+if [ -n "$KDIR" ] && [ -f "$KDIR/vmlinuz" ] && [ -f "$KDIR/initrd" ]; then
+  mkdir -p "$BOOTOUT"
+  cp -f "$KDIR/vmlinuz" "$BOOTOUT/vmlinuz"
+  cp -f "$KDIR/initrd" "$BOOTOUT/initrd"
+  log "Kernel: $KDIR"
+else
+  warn "Kernel/initramfs not found. The real OS mode will need a reinstall."
+fi
+
+log "Testing the preview server"
+cd /flipperone-testing/fake-flipctl2
+( timeout 10 /opt/node/bin/node server.js >/tmp/smoke.log 2>&1 & )
+ok=0
+for i in 1 2 3 4 5 6 7 8; do
+  sleep 1
+  if curl -fsS http://127.0.0.1:8899/api/version >/dev/null 2>&1; then ok=1; break; fi
+done
+pkill -f '/flipperone-testing/fake-flipctl2/server.js' 2>/dev/null || true
+pkill -f 'node server.js' 2>/dev/null || true
+if [ "$ok" = 1 ]; then log "The preview server responds."; else warn "Quick test: no response. Output:"; tail -n 20 /tmp/smoke.log || true; fi
+log "Setup inside the Linux environment finished."
+'@
+
+# Installs a persistent DHCP profile for QEMU's virtio NIC into the Flipper OS
+# image. systemd-networkd then configures eth0 automatically on every boot,
+# independent of the image's built-in defaults. Only the @Minimal subvolume is
+# touched, and only the virtio_net driver matches, so real hardware is never
+# affected. The script is idempotent and fails safely: if anything goes wrong,
+# the image keeps its previous behaviour and the built-in DHCP still works.
+$GuestNetScript = @'
+#!/bin/bash
+set -Eeuo pipefail
+IMG="${1:?Path to the raw image is missing}"
+MNT=/mnt/flipnet
+LOOP=""
+TMP=""
+cleanup() {
+  set +e
+  [ -n "$TMP" ] && rm -f "$TMP" 2>/dev/null
+  umount "$MNT/p" 2>/dev/null || umount -l "$MNT/p" 2>/dev/null
+  [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+  rmdir "$MNT/p" "$MNT" 2>/dev/null
+}
+trap cleanup EXIT
+mkdir -p "$MNT"
+LOOP="$(losetup -fP --show "$IMG")"
+for i in $(seq 1 10); do [ -b "${LOOP}p1" ] && break; sleep 1; done
+DONE=0
+for p in "${LOOP}"p*; do
+  [ -b "$p" ] || continue
+  mkdir -p "$MNT/p"
+  if mount -o rw,subvolid=5 "$p" "$MNT/p" 2>/dev/null; then
+    if [ -d "$MNT/p/@Minimal/etc" ]; then
+      NETDIR="$MNT/p/@Minimal/etc/systemd/network"
+      mkdir -p "$NETDIR"
+      TMP="$NETDIR/.10-qemu-nat.network.tmp"
+      cat > "$TMP" <<'EOF'
+# Added by Flipper One Demo for QEMU user-mode networking (NAT).
+# The emulated machine has no Rockchip Wi-Fi/Ethernet hardware, so this
+# virtio NIC is configured automatically via DHCP. Real hardware is not
+# affected because the match only applies to the virtio_net driver.
+[Match]
+Driver=virtio_net
+Type=ether
+
+[Network]
+DHCP=ipv4
+
+[DHCPv4]
+UseDNS=yes
+UseRoutes=yes
+EOF
+      chown root:root "$TMP"
+      chmod 0644 "$TMP"
+      grep -q '^DHCP=ipv4$' "$TMP"
+      grep -q '^Driver=virtio_net$' "$TMP"
+      mv -f "$TMP" "$NETDIR/10-qemu-nat.network"
+      TMP=""
+      printf '5.0\n' > "$MNT/p/@Minimal/etc/flipper-qemu-net.version"
+      chown root:root "$MNT/p/@Minimal/etc/flipper-qemu-net.version"
+      chmod 0644 "$MNT/p/@Minimal/etc/flipper-qemu-net.version"
+      sync
+      grep -q '^DHCP=ipv4$' "$NETDIR/10-qemu-nat.network"
+      grep -q '^Driver=virtio_net$' "$NETDIR/10-qemu-nat.network"
+      if umount "$MNT/p"; then
+        DONE=1
+      else
+        echo "XX Could not unmount the image cleanly." >&2
+        exit 1
+      fi
+      break
+    fi
+    umount "$MNT/p" 2>/dev/null || true
+  fi
+done
+[ "$DONE" = 1 ] || { echo "XX The Flipper OS root filesystem was not found." >&2; exit 1; }
+echo "OK qemu network profile installed"
+'@
+
+# ---------------------------------------------------------------------------
+# File Manager for your own files
+#
+# The page, the guest service and its systemd unit are embedded below. They are
+# written to disk only while the image is being prepared, so this helper stays a
+# single self-contained file. The service writes to /home/user/Files, the
+# canonical home folder inside Flipper OS.
+# ---------------------------------------------------------------------------
+$ShelfPython = @'
+#!/usr/bin/python3
+"""Flipper One Demo 5.0 - File Manager service.
+
+Serves a small file shelf for /home/user/Files on port 8898.  Only the Python
+standard library is used; the guest image already contains Python 3.13.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import shutil
+import sys
+import tempfile
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
+
+VERSION = "5.0"
+CHUNK = 256 * 1024
+MAX_JSON = 64 * 1024
+TEMP_PREFIX = ".__shelf-upload-"
+TEMP_SUFFIX = ".part"
+
+
+def fsync_dir(path: str) -> None:
+    """Make a rename/mkdir/delete durable even if QEMU is stopped abruptly."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def is_temp_name(name: str) -> bool:
+    return name.startswith(TEMP_PREFIX) and name.endswith(TEMP_SUFFIX)
+
+
+class ShelfError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class Shelf:
+    def __init__(self, root: str):
+        self.root = os.path.realpath(root)
+        os.makedirs(self.root, exist_ok=True)
+        # Remove half-written uploads left behind by an earlier forced stop.
+        for dirpath, _, filenames in os.walk(self.root):
+            for name in filenames:
+                if is_temp_name(name):
+                    try:
+                        os.unlink(os.path.join(dirpath, name))
+                    except OSError:
+                        pass
+
+
+    def resolve(self, rel: str = "") -> str:
+        rel = (rel or "").replace("\\", "/").strip("/")
+        if "\x00" in rel:
+            raise ShelfError(400, "Invalid path.")
+        path = os.path.realpath(os.path.join(self.root, rel))
+        if path != self.root and not path.startswith(self.root + os.sep):
+            raise ShelfError(400, "Path is outside the file shelf.")
+        return path
+
+    def relative(self, path: str) -> str:
+        path = os.path.normpath(path)
+        if path == self.root:
+            return ""
+        return os.path.relpath(path, self.root).replace(os.sep, "/")
+
+
+def clean_name(name: str) -> str:
+    name = (name or "").strip()
+    if "/" in name or "\\" in name:
+        raise ShelfError(400, "The name cannot contain a slash.")
+    if not name or name in (".", ".."):
+        raise ShelfError(400, "A file name is required.")
+    if any(ord(c) < 32 for c in name):
+        raise ShelfError(400, "The file name contains control characters.")
+    if len(name.encode("utf-8")) > 255:
+        raise ShelfError(400, "The file name is too long.")
+    return name
+
+
+def qget(qs, name: str, default: str = "") -> str:
+    values = qs.get(name)
+    return values[0] if values else default
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "FlipperFiles/" + VERSION
+    protocol_version = "HTTP/1.1"
+    shelf: Shelf
+    html_path: str
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def _headers(self, status: int, ctype: str, length: int, extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if extra:
+            for key, value in extra.items():
+                self.send_header(key, value)
+        self.end_headers()
+
+    def _json(self, status: int, payload):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._headers(status, "application/json; charset=utf-8", len(data))
+        self.wfile.write(data)
+
+    def _fail(self, status: int, message: str):
+        self._json(status, {"ok": False, "error": message})
+
+    def _read_json(self):
+        length = self.headers.get("Content-Length")
+        if length is None:
+            raise ShelfError(411, "Content-Length is required.")
+        try:
+            length = int(length)
+        except ValueError:
+            raise ShelfError(400, "Invalid Content-Length.")
+        if length < 0 or length > MAX_JSON:
+            raise ShelfError(413, "Request is too large.")
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ShelfError(400, "Invalid JSON.")
+        if not isinstance(data, dict):
+            raise ShelfError(400, "Invalid request.")
+        return data
+
+    def _html(self):
+        try:
+            with open(self.html_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            data = (b"<!doctype html><meta charset=\"utf-8\"><title>File Manager</title>"
+                    b"<h1>File Manager</h1><p>The page file is missing.</p>")
+        self._headers(200, "text/html; charset=utf-8", len(data))
+        self.wfile.write(data)
+
+    def _status(self):
+        usage = shutil.disk_usage(self.shelf.root)
+        self._json(200, {
+            "ok": True,
+            "version": VERSION,
+            "root": self.shelf.root,
+            "free": usage.free,
+            "total": usage.total,
+        })
+
+    def _list(self, qs):
+        rel = qget(qs, "path", "")
+        folder = self.shelf.resolve(rel)
+        if not os.path.isdir(folder):
+            raise ShelfError(404, "Folder not found.")
+        entries = []
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    if is_temp_name(entry.name):
+                        continue
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if entry.is_symlink():
+                            kind, size = "link", 0
+                        elif entry.is_dir(follow_symlinks=False):
+                            kind, size = "dir", 0
+                        else:
+                            kind, size = "file", st.st_size
+                        entries.append({
+                            "name": entry.name,
+                            "type": kind,
+                            "size": size,
+                            "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                        })
+                    except OSError:
+                        continue
+        except OSError as exc:
+            raise ShelfError(500, "Could not read the folder: %s" % exc)
+        entries.sort(key=lambda item: (0 if item["type"] == "dir" else 1, item["name"].casefold()))
+        usage = shutil.disk_usage(folder)
+        self._json(200, {
+            "ok": True,
+            "path": self.shelf.relative(folder),
+            "entries": entries,
+            "free": usage.free,
+            "total": usage.total,
+        })
+
+    def _download(self, qs):
+        rel = qget(qs, "path", "")
+        path = self.shelf.resolve(rel)
+        if not os.path.isfile(path):
+            raise ShelfError(404, "File not found.")
+        st = os.stat(path)
+        name = os.path.basename(path)
+        inline = qget(qs, "inline", "") in ("1", "true", "yes")
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if not inline:
+            ctype = "application/octet-stream"
+        disposition = "inline" if inline else "attachment"
+        encoded = quote(name, safe="")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(st.st_size))
+        self.send_header("Content-Disposition", "%s; filename*=UTF-8''%s" % (disposition, encoded))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def do_GET(self):
+        try:
+            url = urlparse(self.path)
+            if url.path in ("/", "/index.html"):
+                return self._html()
+            if url.path == "/favicon.ico":
+                return self._headers(204, "image/x-icon", 0)
+            if url.path == "/api/status":
+                return self._status()
+            if url.path == "/api/list":
+                return self._list(parse_qs(url.query))
+            if url.path == "/api/file":
+                return self._download(parse_qs(url.query))
+            raise ShelfError(404, "Not found.")
+        except ShelfError as exc:
+            self._fail(exc.status, exc.message)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # keep the service alive
+            self._fail(500, "Unexpected error: %s" % exc)
+
+    def do_PUT(self):
+        try:
+            url = urlparse(self.path)
+            if url.path != "/api/file":
+                raise ShelfError(404, "Not found.")
+            qs = parse_qs(url.query)
+            folder = self.shelf.resolve(qget(qs, "path", ""))
+            if not os.path.isdir(folder):
+                raise ShelfError(404, "Folder not found.")
+            name = clean_name(qget(qs, "name", ""))
+            length = self.headers.get("Content-Length")
+            if length is None:
+                raise ShelfError(411, "Content-Length is required.")
+            try:
+                length = int(length)
+            except ValueError:
+                raise ShelfError(400, "Invalid Content-Length.")
+            if length < 0:
+                raise ShelfError(400, "Invalid Content-Length.")
+            if length > shutil.disk_usage(folder).free:
+                raise ShelfError(507, "Not enough free space in Flipper OS.")
+            dest = os.path.join(folder, name)
+            if os.path.isdir(dest):
+                raise ShelfError(409, "A folder with this name already exists.")
+            fd, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX, dir=folder)
+            try:
+                remaining = length
+                with os.fdopen(fd, "wb") as out:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(CHUNK, remaining))
+                        if not chunk:
+                            raise ShelfError(400, "The upload was interrupted.")
+                        out.write(chunk)
+                        remaining -= len(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, dest)
+                tmp = None
+                fsync_dir(folder)
+            finally:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            self._json(200, {"ok": True, "name": name, "path": self.shelf.relative(dest)})
+        except ShelfError as exc:
+            self._fail(exc.status, exc.message)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            self._fail(500, "Upload failed: %s" % exc)
+
+    def do_POST(self):
+        try:
+            url = urlparse(self.path)
+            if url.path not in ("/api/mkdir", "/api/rename", "/api/delete"):
+                raise ShelfError(404, "Not found.")
+            data = self._read_json()
+            if url.path == "/api/mkdir":
+                return self._mkdir(data)
+            if url.path == "/api/rename":
+                return self._rename(data)
+            return self._delete(data)
+        except ShelfError as exc:
+            self._fail(exc.status, exc.message)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            self._fail(500, "Request failed: %s" % exc)
+
+    def _mkdir(self, data):
+        folder = self.shelf.resolve(str(data.get("path", "")))
+        if not os.path.isdir(folder):
+            raise ShelfError(404, "Folder not found.")
+        name = clean_name(str(data.get("name", "")))
+        target = os.path.join(folder, name)
+        if os.path.lexists(target):
+            raise ShelfError(409, "A file or folder with this name already exists.")
+        try:
+            os.mkdir(target, 0o755)
+        except OSError as exc:
+            raise ShelfError(500, "Could not create the folder: %s" % exc)
+        fsync_dir(folder)
+        self._json(200, {"ok": True, "path": self.shelf.relative(target)})
+
+    def _rename(self, data):
+        source = self.shelf.resolve(str(data.get("path", "")))
+        if source == self.shelf.root:
+            raise ShelfError(400, "The shelf root cannot be renamed.")
+        if not os.path.lexists(source):
+            raise ShelfError(404, "File or folder not found.")
+        name = clean_name(str(data.get("name", "")))
+        target = os.path.join(os.path.dirname(source), name)
+        if target != source and os.path.lexists(target):
+            raise ShelfError(409, "A file or folder with this name already exists.")
+        try:
+            os.rename(source, target)
+        except OSError as exc:
+            raise ShelfError(500, "Could not rename: %s" % exc)
+        fsync_dir(os.path.dirname(source))
+        if os.path.dirname(target) != os.path.dirname(source):
+            fsync_dir(os.path.dirname(target))
+        self._json(200, {"ok": True, "path": self.shelf.relative(target)})
+
+    def _delete(self, data):
+        target = self.shelf.resolve(str(data.get("path", "")))
+        if target == self.shelf.root:
+            raise ShelfError(400, "The shelf root cannot be deleted.")
+        if not os.path.lexists(target):
+            raise ShelfError(404, "File or folder not found.")
+        try:
+            if os.path.islink(target) or not os.path.isdir(target):
+                os.unlink(target)
+            else:
+                shutil.rmtree(target)
+        except OSError as exc:
+            raise ShelfError(500, "Could not delete: %s" % exc)
+        fsync_dir(os.path.dirname(target))
+        self._json(200, {"ok": True})
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Flipper One Demo File Manager")
+    parser.add_argument("--root", default="/home/user/Files")
+    parser.add_argument("--port", type=int, default=8898)
+    parser.add_argument("--bind", default="0.0.0.0")
+    args = parser.parse_args()
+
+    shelf = Shelf(args.root)
+    Handler.shelf = shelf
+    Handler.html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files-shelf.html")
+    httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
+    httpd.daemon_threads = True
+    print("File Manager %s on %s:%d, root %s" % (VERSION, args.bind, args.port, shelf.root), flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()
+'@
+
+$ShelfHtml = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>File Manager · Flipper One</title>
+<style>
+  :root {
+    --ground: #14171C;
+    --card: #1D2026;
+    --line: #2B2F37;
+    --ink: #fff;
+    --dim: #8A9099;
+    --amber: #FF8200;
+    --bad: #FF6B6B;
+    --good: #7BC96F;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; min-height: 100%;
+    background: var(--ground);
+    color: var(--ink);
+    font: 13px/1.5 system-ui, sans-serif;
+  }
+  button, input { font: inherit; }
+  a { color: var(--amber); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .bar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; padding: 12px 20px;
+    background: rgba(20, 23, 28, .96);
+    border-bottom: 1px solid var(--line);
+    backdrop-filter: blur(6px);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--amber); box-shadow: 0 0 10px var(--amber); flex: none;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  .ver { color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .bar nav { display: flex; align-items: center; gap: 8px; flex: none; }
+  main { max-width: 1100px; margin: 0 auto; padding: 22px 20px 40px; }
+  .lead {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 20px; margin-bottom: 16px;
+  }
+  .lead h2 { margin: 0 0 2px; font-size: 20px; font-weight: 600; letter-spacing: -.01em; }
+  .lead p { margin: 0; color: var(--dim); max-width: 62ch; }
+  code {
+    color: #d7dbe0; background: #0f1216;
+    border: 1px solid var(--line); border-radius: 3px; padding: 0 4px;
+  }
+  .actions { display: flex; gap: 8px; flex: none; }
+  button {
+    cursor: pointer; background: transparent; color: var(--amber);
+    border: 1px solid var(--amber); border-radius: 4px;
+    padding: 5px 11px; font-size: 12px;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  button:hover:not(:disabled) { background: var(--amber); color: #000; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--amber); color: #000; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #ffa040; border-color: #ffa040; }
+  button.ghost { color: var(--dim); border-color: var(--line); }
+  button.ghost:hover:not(:disabled) { color: #000; background: var(--dim); border-color: var(--dim); }
+  button.danger { color: var(--dim); border-color: var(--line); }
+  button.danger:hover:not(:disabled) { color: #000; background: var(--bad); border-color: var(--bad); }
+  button.small { padding: 2px 8px; font-size: 11px; }
+  .crumbs {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+    margin: 0 0 10px; color: var(--dim); min-height: 24px;
+  }
+  .crumbs button { border: 0; padding: 1px 4px; color: var(--dim); font-size: 12px; }
+  .crumbs button:hover:not(:disabled) { background: transparent; color: var(--amber); }
+  .crumbs .here { color: var(--ink); }
+  .crumbs .sep { color: #4a505a; }
+  .card { background: var(--card); border-radius: 6px; overflow: hidden; }
+  .card-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    color: var(--dim); font-size: 11px;
+  }
+  .card-head .stat { color: var(--ink); }
+  .card-head .stat.bad { color: var(--bad); }
+  .list { min-height: 180px; }
+  .row {
+    display: grid; grid-template-columns: minmax(0, 1fr) 90px 150px 170px;
+    align-items: center; gap: 10px;
+    padding: 9px 14px; border-bottom: 1px solid var(--line);
+  }
+  .row:last-child { border-bottom: 0; }
+  .row:hover { background: #22262d; }
+  .name { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .icon { width: 18px; text-align: center; flex: none; color: var(--dim); }
+  .icon.dir { color: var(--amber); }
+  .name button {
+    border: 0; padding: 0; color: var(--ink);
+    text-align: left; overflow-wrap: anywhere;
+  }
+  .name button:hover:not(:disabled) { background: transparent; color: var(--amber); }
+  .meta { color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .actions-cell { display: flex; justify-content: flex-end; gap: 6px; }
+  .actions-cell button { opacity: .75; }
+  .row:hover .actions-cell button { opacity: 1; }
+  .empty { padding: 34px 18px; text-align: center; color: var(--dim); }
+  .empty strong { display: block; color: var(--ink); margin-bottom: 4px; font-size: 14px; }
+  .drop-hint { color: var(--dim); font-size: 12px; }
+  .uploads {
+    display: grid; gap: 1px; background: var(--line);
+    border-radius: 6px; overflow: hidden; margin-top: 14px;
+  }
+  .uploads:empty { display: none; }
+  .upload {
+    display: grid; grid-template-columns: minmax(0, 1fr) 130px 60px;
+    gap: 12px; align-items: center; padding: 9px 14px; background: var(--card);
+  }
+  .upload .uname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { height: 5px; background: #0f1216; border-radius: 99px; overflow: hidden; }
+  .bar-fill { height: 100%; width: 0; background: var(--amber); transition: width .15s; }
+  .upload .ustat {
+    color: var(--dim); font-size: 11px; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .upload.done .bar-fill { background: var(--good); }
+  .upload.fail .bar-fill { background: var(--bad); }
+  footer { margin-top: 18px; color: var(--dim); font-size: 11px; line-height: 1.7; }
+  .overlay {
+    position: fixed; inset: 0; z-index: 20; display: none; place-items: center;
+    background: rgba(20, 23, 28, .92);
+    border: 3px dashed var(--amber);
+    color: var(--amber); font-size: 18px; font-weight: 600;
+  }
+  .overlay.show { display: grid; }
+  .toast {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    max-width: 90vw; background: #2a2f37; color: var(--ink);
+    border: 1px solid var(--line); border-left: 3px solid var(--amber);
+    border-radius: 4px; padding: 9px 14px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+    opacity: 0; pointer-events: none; transition: opacity .15s; z-index: 30;
+  }
+  .toast.show { opacity: 1; }
+  .toast.bad { border-left-color: var(--bad); }
+  .modal {
+    position: fixed; inset: 0; z-index: 25; display: none; place-items: center;
+    background: rgba(0, 0, 0, .55); padding: 20px;
+  }
+  .modal.show { display: grid; }
+  .modal-card {
+    width: min(420px, 100%); background: var(--card);
+    border: 1px solid var(--line); border-radius: 6px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .55); overflow: hidden;
+  }
+  .modal-card h3 {
+    margin: 0; padding: 14px 16px; font-size: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .modal-body { padding: 14px 16px; color: var(--dim); }
+  .modal-body p { margin: 0 0 10px; }
+  .modal-body input {
+    width: 100%; background: var(--ground); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 4px; padding: 7px 9px;
+  }
+  .modal-body input:focus { outline: none; border-color: var(--amber); }
+  .modal-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 12px 16px; border-top: 1px solid var(--line);
+  }
+  @media (max-width: 760px) {
+    .row { grid-template-columns: minmax(0, 1fr) 80px 150px; }
+    .row .meta.date { display: none; }
+    .lead { align-items: flex-start; flex-direction: column; }
+    .bar .ver { display: none; }
+  }
+  @media (max-width: 520px) {
+    main { padding: 16px 12px 30px; }
+    .bar { padding: 10px 12px; }
+    .row { grid-template-columns: minmax(0, 1fr) auto; }
+    .row .meta.size { display: none; }
+    .upload { grid-template-columns: minmax(0, 1fr) 90px; }
+    .upload .ustat { display: none; }
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>File Manager</h1>
+    <span class="ver">Flipper One Demo 5.0</span>
+  </div>
+  <nav>
+    <a id="app-link" href="http://127.0.0.1:8899/apps" target="_blank" rel="noopener">App Manager</a>
+    <button id="refresh" class="ghost" type="button">Refresh</button>
+  </nav>
+</header>
+<main>
+  <div class="lead">
+    <div>
+      <h2>Your files</h2>
+      <p>Stored inside Flipper OS at <code>/home/user/Files</code>. Apps can open them there.</p>
+    </div>
+    <div class="actions">
+      <button id="newdir" class="ghost" type="button">New folder</button>
+      <button id="upload" class="primary" type="button">Upload files</button>
+    </div>
+  </div>
+  <div class="crumbs" id="crumbs"></div>
+  <section class="card">
+    <div class="card-head">
+      <span class="stat" id="stat">Loading …</span>
+      <span id="space"></span>
+    </div>
+    <div class="list" id="list"></div>
+  </section>
+  <div class="uploads" id="uploads"></div>
+  <footer>
+    Drop files anywhere on this page to upload them. Changes are saved immediately.<br>
+    A backup copy of this folder is kept on this PC and restored after a reinstall.
+  </footer>
+</main>
+<div class="overlay" id="overlay">Drop files to upload</div>
+<div class="toast" id="toast"></div>
+<div class="modal" id="modal">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title"></h3>
+    <div class="modal-body">
+      <p id="modal-message"></p>
+      <input id="modal-input" type="text" autocomplete="off" hidden>
+    </div>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="ghost" type="button">Cancel</button>
+      <button id="modal-ok" class="primary" type="button">OK</button>
+    </div>
+  </div>
+</div>
+<input id="picker" type="file" multiple hidden>
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const state = { path: "", busy: false };
+  const rootLabel = "Files";
+
+  const appParam = new URLSearchParams(location.search).get("app");
+  if (appParam && /^\d{2,5}$/.test(appParam)) {
+    const appPort = Number(appParam);
+    if (appPort >= 1 && appPort <= 65535) {
+      $("app-link").href = "http://127.0.0.1:" + appPort + "/apps";
+    }
+  }
+
+  const fmtSize = (n) => {
+    if (!Number.isFinite(n) || n < 0) return "—";
+    if (n < 1024) return n + " B";
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = n / 1024;
+    let index = 0;
+    while (value >= 1024 && index < units.length - 1) {
+      value /= 1024;
+      index++;
+    }
+    return (value < 10 ? value.toFixed(1) : Math.round(value)) + " " + units[index];
+  };
+
+  const fmtDate = (value) => {
+    const date = new Date(value);
+    if (isNaN(date)) return "";
+    const now = new Date();
+    const sameYear = date.getFullYear() === now.getFullYear();
+    const day = date.toLocaleDateString(undefined,
+      sameYear ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" });
+    const time = date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    return day + " " + time;
+  };
+
+  const join = (a, b) => (a ? a + "/" + b : b);
+  const enc = encodeURIComponent;
+
+  function toast(message, bad) {
+    const node = $("toast");
+    node.textContent = message;
+    node.className = "toast show" + (bad ? " bad" : "");
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => { node.className = "toast"; }, 4200);
+  }
+
+  function say(message, bad) {
+    const node = $("stat");
+    node.textContent = message;
+    node.className = "stat" + (bad ? " bad" : "");
+  }
+
+  function setBusy(value) {
+    state.busy = value;
+    for (const button of document.querySelectorAll("button")) button.disabled = value;
+    if (!value) renderCrumbs();
+  }
+
+  let modalResolve = null;
+
+  function syncModalOk() {
+    const input = $("modal-input");
+    $("modal-ok").disabled = !input.hidden && !input.value.trim();
+  }
+
+  function openModal(options) {
+    return new Promise((resolve) => {
+      modalResolve = resolve;
+      $("modal-title").textContent = options.title || "";
+      $("modal-message").textContent = options.message || "";
+      const input = $("modal-input");
+      input.hidden = !options.withInput;
+      input.value = options.value || "";
+      const ok = $("modal-ok");
+      ok.textContent = options.okLabel || "OK";
+      ok.className = options.danger ? "danger" : "primary";
+      syncModalOk();
+      $("modal").classList.add("show");
+      if (options.withInput) {
+        setTimeout(() => { input.focus(); input.select(); }, 0);
+      } else {
+        setTimeout(() => ok.focus(), 0);
+      }
+    });
+  }
+
+  function closeModal(value) {
+    $("modal").classList.remove("show");
+    const resolve = modalResolve;
+    modalResolve = null;
+    if (resolve) resolve(value);
+  }
+
+  $("modal-cancel").addEventListener("click", () => closeModal(null));
+  $("modal-ok").addEventListener("click", () => {
+    const input = $("modal-input");
+    closeModal(input.hidden ? true : input.value.trim());
+  });
+  $("modal-input").addEventListener("input", syncModalOk);
+  $("modal-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (!$("modal-ok").disabled) $("modal-ok").click();
+    }
+  });
+  $("modal").addEventListener("click", (event) => {
+    if (event.target === $("modal")) closeModal(null);
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && $("modal").classList.contains("show")) closeModal(null);
+  });
+
+  async function api(url, options) {
+    const response = await fetch(url, options);
+    let answer = null;
+    try { answer = await response.json(); } catch (_) { }
+    if (!response.ok || (answer && answer.ok === false)) {
+      throw new Error((answer && answer.error) || ("Request failed (HTTP " + response.status + ")"));
+    }
+    return answer || {};
+  }
+
+  function renderCrumbs() {
+    const crumbs = $("crumbs");
+    crumbs.textContent = "";
+    const root = document.createElement("button");
+    root.type = "button";
+    root.textContent = rootLabel;
+    root.className = state.path ? "" : "here";
+    root.disabled = state.busy;
+    root.addEventListener("click", () => navigate(""));
+    crumbs.appendChild(root);
+
+    const parts = state.path ? state.path.split("/") : [];
+    let accumulated = "";
+    for (const part of parts) {
+      accumulated = join(accumulated, part);
+      const separator = document.createElement("span");
+      separator.className = "sep";
+      separator.textContent = "/";
+      crumbs.appendChild(separator);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = part;
+      if (accumulated === state.path) button.className = "here";
+      button.disabled = state.busy;
+      const target = accumulated;
+      button.addEventListener("click", () => navigate(target));
+      crumbs.appendChild(button);
+    }
+  }
+
+  function makeButton(label, className, handler) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = label;
+    button.disabled = state.busy;
+    button.addEventListener("click", handler);
+    return button;
+  }
+
+  function row(entry) {
+    const line = document.createElement("div");
+    line.className = "row";
+
+    const name = document.createElement("div");
+    name.className = "name";
+    const icon = document.createElement("span");
+    icon.className = "icon" + (entry.type === "dir" ? " dir" : "");
+    icon.textContent = entry.type === "dir" ? "▸" : entry.type === "link" ? "↗" : "•";
+    const label = document.createElement("button");
+    label.type = "button";
+    label.textContent = entry.name;
+    label.title = entry.name;
+    if (entry.type === "dir") {
+      label.addEventListener("click", () => navigate(join(state.path, entry.name)));
+    } else if (entry.type === "file") {
+      label.addEventListener("click", () => download(entry));
+    }
+    name.append(icon, label);
+
+    const size = document.createElement("span");
+    size.className = "meta size";
+    size.textContent = entry.type === "dir" ? "Folder" : entry.type === "link" ? "Link" : fmtSize(entry.size);
+
+    const date = document.createElement("span");
+    date.className = "meta date";
+    date.textContent = fmtDate(entry.mtime);
+
+    const actions = document.createElement("div");
+    actions.className = "actions-cell";
+    if (entry.type === "file") {
+      actions.appendChild(makeButton("Download", "small ghost", () => download(entry)));
+    }
+    actions.appendChild(makeButton("Rename", "small ghost", () => rename(entry)));
+    actions.appendChild(makeButton("Delete", "small danger", () => remove(entry)));
+
+    line.append(name, size, date, actions);
+    return line;
+  }
+
+  function download(entry) {
+    const link = document.createElement("a");
+    link.href = "/api/file?path=" + enc(join(state.path, entry.name));
+    link.download = entry.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  async function load() {
+    setBusy(true);
+    say("Loading …");
+    try {
+      const answer = await api("/api/list?path=" + enc(state.path));
+      state.path = answer.path || "";
+      const list = $("list");
+      list.textContent = "";
+      if (!answer.entries || answer.entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        const strong = document.createElement("strong");
+        strong.textContent = "This folder is empty";
+        const hint = document.createElement("span");
+        hint.className = "drop-hint";
+        hint.textContent = "Drop files here or choose Upload files.";
+        empty.append(strong, hint);
+        list.appendChild(empty);
+      } else {
+        for (const entry of answer.entries) list.appendChild(row(entry));
+      }
+      $("space").textContent = fmtSize(answer.free) + " free";
+      say(answer.entries.length + " item" + (answer.entries.length === 1 ? "" : "s"));
+      renderCrumbs();
+    } catch (error) {
+      say("File Manager is not reachable.", true);
+      toast(error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function navigate(path) {
+    if (state.busy) return;
+    state.path = path || "";
+    load();
+  }
+
+  async function newFolder() {
+    if (state.busy) return;
+    const name = await openModal({
+      title: "New folder",
+      message: "Create a folder inside " + (state.path ? "this folder" : "Files") + ".",
+      value: "",
+      okLabel: "Create",
+      withInput: true
+    });
+    if (name === null || !name) return;
+    setBusy(true);
+    try {
+      await api("/api/mkdir", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: state.path, name })
+      });
+      toast("Folder created.");
+      await load();
+    } catch (error) {
+      toast(error.message, true);
+      setBusy(false);
+    }
+  }
+
+  async function rename(entry) {
+    if (state.busy) return;
+    const name = await openModal({
+      title: "Rename",
+      message: "Enter a new name for “" + entry.name + "”.",
+      value: entry.name,
+      okLabel: "Rename",
+      withInput: true
+    });
+    if (name === null || name === entry.name) return;
+    setBusy(true);
+    try {
+      await api("/api/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: join(state.path, entry.name), name })
+      });
+      toast("Renamed.");
+      await load();
+    } catch (error) {
+      toast(error.message, true);
+      setBusy(false);
+    }
+  }
+
+  async function remove(entry) {
+    if (state.busy) return;
+    const what = entry.type === "dir" ? "folder and everything in it" : "file";
+    const ok = await openModal({
+      title: "Delete",
+      message: "Delete the " + what + " “" + entry.name + "”? This cannot be undone.",
+      okLabel: "Delete",
+      danger: true,
+      withInput: false
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await api("/api/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: join(state.path, entry.name) })
+      });
+      toast("Deleted.");
+      await load();
+    } catch (error) {
+      toast(error.message, true);
+      setBusy(false);
+    }
+  }
+
+  function uploadRow(name) {
+    const line = document.createElement("div");
+    line.className = "upload";
+    const label = document.createElement("span");
+    label.className = "uname";
+    label.textContent = name;
+    label.title = name;
+    const track = document.createElement("div");
+    track.className = "bar-track";
+    const fill = document.createElement("div");
+    fill.className = "bar-fill";
+    track.appendChild(fill);
+    const status = document.createElement("span");
+    status.className = "ustat";
+    status.textContent = "0%";
+    line.append(label, track, status);
+    $("uploads").appendChild(line);
+    return { line, fill, status };
+  }
+
+  async function uploadFiles(files) {
+    const list = Array.from(files || []);
+    if (!list.length || state.busy) return;
+    setBusy(true);
+    const target = state.path;
+    say("Uploading " + list.length + " file" + (list.length === 1 ? "" : "s") + " …");
+    let good = 0;
+    let bad = 0;
+    for (const file of list) {
+      const ui = uploadRow(file.name);
+      try {
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("PUT", "/api/file?path=" + enc(target) + "&name=" + enc(file.name));
+          xhr.upload.addEventListener("progress", (event) => {
+            if (!event.lengthComputable) return;
+            const percent = Math.max(0, Math.min(100, Math.round(event.loaded / event.total * 100)));
+            ui.fill.style.width = percent + "%";
+            ui.status.textContent = percent + "%";
+          });
+          xhr.addEventListener("load", () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              ui.fill.style.width = "100%";
+              ui.status.textContent = "Done";
+              ui.line.classList.add("done");
+              resolve();
+              return;
+            }
+            let message = "HTTP " + xhr.status;
+            try {
+              const answer = JSON.parse(xhr.responseText);
+              if (answer.error) message = answer.error;
+            } catch (_) { }
+            reject(new Error(message));
+          });
+          xhr.addEventListener("error", () => reject(new Error("Network error")));
+          xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
+          xhr.send(file);
+        });
+        good++;
+      } catch (error) {
+        bad++;
+        ui.line.classList.add("fail");
+        ui.status.textContent = "Failed";
+        ui.line.title = error.message;
+      }
+    }
+    say(bad ? good + " uploaded, " + bad + " failed" : good + " uploaded", bad > 0);
+    if (bad) toast(bad + " file(s) could not be uploaded.", true);
+    else toast("Upload finished.");
+    await load();
+    setTimeout(() => { $("uploads").textContent = ""; }, 6000);
+  }
+
+  $("refresh").addEventListener("click", load);
+  $("newdir").addEventListener("click", newFolder);
+  $("upload").addEventListener("click", () => $("picker").click());
+  $("picker").addEventListener("change", (event) => {
+    uploadFiles(event.target.files);
+    event.target.value = "";
+  });
+
+  let dragDepth = 0;
+  function hasFiles(event) {
+    return event.dataTransfer && Array.from(event.dataTransfer.types || []).includes("Files");
+  }
+  window.addEventListener("dragenter", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dragDepth++;
+    $("overlay").classList.add("show");
+  });
+  window.addEventListener("dragover", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  window.addEventListener("dragleave", (event) => {
+    if (!event.dataTransfer) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) $("overlay").classList.remove("show");
+  });
+  window.addEventListener("drop", (event) => {
+    event.preventDefault();
+    dragDepth = 0;
+    $("overlay").classList.remove("show");
+    if (event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files.length) {
+      uploadFiles(event.dataTransfer.files);
+    }
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      $("overlay").classList.remove("show");
+      dragDepth = 0;
+    }
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>
+'@
+
+$ShelfUnit = @'
+[Unit]
+Description=Flipper One Demo File Manager
+Documentation=https://github.com/flipperdevices/flipperone-testing
+After=network.target local-fs.target
+RequiresMountsFor=/home/user/Files
+
+[Service]
+Type=simple
+User=user
+Group=user
+ExecStart=/usr/bin/python3 /usr/local/lib/flipper-one-demo/files-shelf.py --root /home/user/Files --port 8898 --bind 0.0.0.0
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+'@
+
+# Copies the File Manager into the Flipper OS image. The script is idempotent:
+# it updates the service files, keeps /home/user/Files untouched, and only
+# writes to the @Minimal and @home subvolumes.
+$GuestShelfScript = @'
+#!/bin/bash
+set -Eeuo pipefail
+IMG="${1:?Path to the raw image is missing}"
+PY="${2:?Path to the service is missing}"
+HTML="${3:?Path to the page is missing}"
+UNIT="${4:?Path to the unit is missing}"
+MNT=/mnt/flipshelf
+LOOP=""
+cleanup() {
+  set +e
+  umount "$MNT/p" 2>/dev/null || umount -l "$MNT/p" 2>/dev/null
+  [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+  rmdir "$MNT/p" "$MNT" 2>/dev/null
+}
+trap cleanup EXIT
+mkdir -p "$MNT"
+LOOP="$(losetup -fP --show "$IMG")" || { echo "XX Could not attach the image." >&2; exit 1; }
+for i in $(seq 1 10); do [ -b "${LOOP}p3" ] && break; sleep 1; done
+DONE=0
+for p in "${LOOP}"p*; do
+  [ -b "$p" ] || continue
+  mkdir -p "$MNT/p"
+  if mount -o rw,subvolid=5 "$p" "$MNT/p" 2>/dev/null; then
+    if [ -d "$MNT/p/@Minimal/etc" ] && [ -d "$MNT/p/@home/user" ]; then
+      ROOT="$MNT/p/@Minimal"
+      HOME_DIR="$MNT/p/@home/user"
+      mkdir -p "$ROOT/usr/local/lib/flipper-one-demo"
+      install -m 0755 -o root -g root "$PY" "$ROOT/usr/local/lib/flipper-one-demo/files-shelf.py"
+      install -m 0644 -o root -g root "$HTML" "$ROOT/usr/local/lib/flipper-one-demo/files-shelf.html"
+      install -m 0644 -o root -g root "$UNIT" "$ROOT/etc/systemd/system/flipper-files-shelf.service"
+      mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"
+      ln -sfn ../flipper-files-shelf.service "$ROOT/etc/systemd/system/multi-user.target.wants/flipper-files-shelf.service"
+      install -d -m 0755 -o 1000 -g 1000 "$HOME_DIR/Files"
+      if [ ! -f "$HOME_DIR/Files/README.txt" ]; then
+        cat > "$HOME_DIR/Files/README.txt" <<'EOF'
+This folder belongs to you.
+
+Files placed here are stored inside Flipper OS at /home/user/Files.
+Use the File Manager in the Flipper One Demo menu to upload, download,
+rename or delete them while the emulator is running.
+
+You can also keep files in subfolders.
+EOF
+        chown 1000:1000 "$HOME_DIR/Files/README.txt"
+        chmod 0644 "$HOME_DIR/Files/README.txt"
+      fi
+      printf '5.0\n' > "$ROOT/etc/flipper-files-shelf.version"
+      chown root:root "$ROOT/etc/flipper-files-shelf.version"
+      chmod 0644 "$ROOT/etc/flipper-files-shelf.version"
+      sync
+      test -x "$ROOT/usr/local/lib/flipper-one-demo/files-shelf.py"
+      test -f "$ROOT/usr/local/lib/flipper-one-demo/files-shelf.html"
+      test -f "$ROOT/etc/systemd/system/flipper-files-shelf.service"
+      test -L "$ROOT/etc/systemd/system/multi-user.target.wants/flipper-files-shelf.service"
+      test -d "$HOME_DIR/Files"
+      if umount "$MNT/p"; then
+        DONE=1
+      else
+        echo "XX Could not unmount the image cleanly." >&2
+        exit 1
+      fi
+      break
+    fi
+    umount "$MNT/p" 2>/dev/null || true
+  fi
+done
+[ "$DONE" = 1 ] || { echo "XX The Flipper OS root filesystem was not found." >&2; exit 1; }
+echo "OK File Manager installed in the image"
+'@
+
+# Exports or imports /home/user/Files through a temporary loop mount. Used for
+# the PC backup and for restoring files after a reinstall.
+$GuestFilesScript = @'
+#!/bin/bash
+set -Eeuo pipefail
+IMG="${1:?Path to the raw image is missing}"
+MODE="${2:?Mode is missing}"
+HOSTDIR="${3:?Path to the PC backup is missing}"
+# QEMU is stopped before this runs. Mount read-write so btrfs can replay its
+# log after a hard shutdown; export itself only reads from the image.
+MOUNT_OPT="rw"
+MNT=/mnt/flipfiles
+LOOP=""
+cleanup() {
+  set +e
+  umount "$MNT/p" 2>/dev/null || umount -l "$MNT/p" 2>/dev/null
+  [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+  rmdir "$MNT/p" "$MNT" 2>/dev/null
+}
+trap cleanup EXIT
+mkdir -p "$MNT"
+LOOP="$(losetup -fP --show "$IMG")" || { echo "XX Could not attach the image." >&2; exit 1; }
+for i in $(seq 1 10); do [ -b "${LOOP}p3" ] && break; sleep 1; done
+DONE=0
+for p in "${LOOP}"p*; do
+  [ -b "$p" ] || continue
+  mkdir -p "$MNT/p"
+  if mount -o "$MOUNT_OPT",subvolid=5 "$p" "$MNT/p" 2>/dev/null; then
+    if [ -d "$MNT/p/@Minimal/etc" ] && [ -d "$MNT/p/@home/user" ]; then
+      GUEST="$MNT/p/@home/user/Files"
+      if [ "$MODE" = "Export" ]; then
+        if [ -d "$GUEST" ]; then
+          mkdir -p "$HOSTDIR"
+          rsync -rltL --delete --exclude='.__shelf-upload-*.part' "$GUEST"/ "$HOSTDIR"/
+          echo "OK files exported to the PC backup"
+        else
+          echo "OK no files to export yet"
+        fi
+      else
+        if [ -d "$HOSTDIR" ] && [ -n "$(ls -A "$HOSTDIR" 2>/dev/null)" ]; then
+          install -d -m 0755 -o 1000 -g 1000 "$GUEST"
+          rsync -rltLp --chown=1000:1000 --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r --exclude='.__shelf-upload-*.part' "$HOSTDIR"/ "$GUEST"/
+          echo "OK files restored from the PC backup"
+        else
+          echo "OK no PC backup to restore"
+        fi
+      fi
+      sync
+      if umount "$MNT/p"; then
+        DONE=1
+      else
+        echo "XX Could not unmount the image cleanly." >&2
+        exit 1
+      fi
+      break
+    fi
+    umount "$MNT/p" 2>/dev/null || true
+  fi
+done
+[ "$DONE" = 1 ] || { echo "XX The Flipper OS root filesystem was not found." >&2; exit 1; }
+'@
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+function Say($m)  { Write-Host "==> $m" -ForegroundColor Cyan }
+function Warn($m) { Write-Host "!!  $m" -ForegroundColor Yellow }
+function Pause-Close { Read-Host 'Press Enter to close this window' | Out-Null }
+function Fail($m) { Write-Host "XX  $m" -ForegroundColor Red; Pause-Close; exit 1 }
+
+function Get-FreeGB {
+    try {
+        $name = $env:SystemDrive.TrimEnd(':')
+        $free = (Get-PSDrive -Name $name -ErrorAction Stop).Free
+        return [math]::Round($free / 1GB, 1)
+    } catch {
+        try { return [math]::Round((Get-PSDrive -Name 'C' -ErrorAction Stop).Free / 1GB, 1) } catch { return 999 }
+    }
+}
+
+function Assert-Space($gb, $what) {
+    $free = Get-FreeGB
+    if ($free -lt [double]$gb) {
+        Fail ("Not enough free disk space. {0} needs about {1} GB, but only {2} GB are free on {3}." -f $what, $gb, $free, $env:SystemDrive)
+    }
+}
+
+function Get-File($urls, $dest, $optional = $false) {
+    $dest = [string]$dest
+    if ((Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).Length -gt 0)) { return $true }
+    $parent = Split-Path -Parent $dest
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+    foreach ($u in @($urls)) {
+        $part = "$dest.part"
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        Say "Downloading: $u"
+        $ok = $false
+        if (Get-Command 'curl.exe' -ErrorAction SilentlyContinue) {
+            & curl.exe -L --fail --retry 3 --retry-delay 2 --progress-bar -o $part $u
+            $ok = ($LASTEXITCODE -eq 0)
+        } else {
+            try {
+                Invoke-WebRequest -Uri $u -OutFile $part -UseBasicParsing
+                $ok = $true
+            } catch { $ok = $false }
+        }
+        if ($ok -and (Test-Path -LiteralPath $part) -and ((Get-Item -LiteralPath $part).Length -gt 0)) {
+            Move-Item -LiteralPath $part -Destination $dest -Force
+            return $true
+        }
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        Warn "Download failed: $u"
+    }
+    if ($optional) { return $false }
+    Fail ('Download failed. Please check your internet connection and try again: ' + (@($urls) -join ' , '))
+}
+
+function Resolve-UbuntuUrls {
+    $urls = New-Object System.Collections.ArrayList
+    [void]$urls.Add($UbuntuBase + 'current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz')
+    try {
+        $idx = (Invoke-WebRequest -Uri $UbuntuBase -UseBasicParsing -TimeoutSec 20).Content
+        $dates = [regex]::Matches($idx, 'href="(\d{8})/"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Descending
+        foreach ($d in ($dates | Select-Object -First 3)) {
+            $sub = (Invoke-WebRequest -Uri ($UbuntuBase + $d + '/') -UseBasicParsing -TimeoutSec 20).Content
+            $names = [regex]::Matches($sub, 'href="(ubuntu-noble-wsl-amd64-[A-Za-z0-9._-]*\.rootfs\.tar\.gz)"') | ForEach-Object { $_.Groups[1].Value }
+            $pick = $names | Where-Object { $_ -like '*-wsl.rootfs.tar.gz' } | Select-Object -First 1
+            if (-not $pick) { $pick = $names | Select-Object -First 1 }
+            if ($pick) { [void]$urls.Add($UbuntuBase + $d + '/' + $pick) }
+        }
+    } catch { }
+    [void]$urls.Add($UbuntuBase + '20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz')
+    return , $urls.ToArray()
+}
+
+function Test-WslReady {
+    try { & wsl.exe --status *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false }
+}
+
+function Test-Distro {
+    $old = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.Encoding]::Unicode
+        $l = (& wsl.exe -l -q) | Out-String
+    } finally { [Console]::OutputEncoding = $old }
+    $l = $l -replace "`0", ''
+    $names = ($l -split "`r?`n") | ForEach-Object { $_.Trim() }
+    return ($names -contains $Distro)
+}
+
+function Test-DistroHealthy {
+    if (-not (Test-Distro)) { return $false }
+    & wsl.exe -d $Distro -u root --exec /bin/true *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function ConvertTo-WslPath($p) {
+    $d = $p.Substring(0, 1).ToLower()
+    return '/mnt/' + $d + ($p.Substring(2) -replace '\\', '/')
+}
+
+function Test-Server {
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/version" -UseBasicParsing -TimeoutSec 5
+        if ($r.StatusCode -eq 200 -and $r.Content -match '"id"') { return $true }
+        $script:LastErr = 'HTTP ' + $r.StatusCode
+    } catch { $script:LastErr = $_.Exception.Message }
+    return $false
+}
+
+function Test-PortFree($p) {
+    $listener = $null
+    try {
+        $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, [int]$p)
+        $listener.Start()
+        return $true
+    } catch { return $false }
+    finally {
+        if ($listener) { try { $listener.Stop() } catch { } }
+    }
+}
+
+function Select-FreePort {
+    for ($p = $Port; $p -le 8999; $p++) {
+        if (Test-PortFree $p) { return $p }
+    }
+    Fail 'No free local port was found. Please close other programs and try again.'
+}
+
+function Ensure-Wsl {
+    if (Test-WslReady) { return $true }
+    Warn 'WSL (Windows Subsystem for Linux) is required but is not enabled yet.'
+    Write-Host ''
+    Write-Host 'Windows will now ask once for administrator permission to enable WSL.' -ForegroundColor Yellow
+    Write-Host 'This is a Windows requirement. The app itself does not need admin rights.' -ForegroundColor Yellow
+    Write-Host ''
+    try {
+        $p = Start-Process -FilePath 'wsl.exe' -ArgumentList @('--install', '--no-distribution') -Verb RunAs -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Warn "The WSL installation returned code $($p.ExitCode)." }
+    } catch {
+        Fail 'WSL could not be enabled because the administrator prompt was cancelled. Run this file again and allow the prompt.'
+    }
+    if (Test-WslReady) { Say 'WSL is ready.'; return $true }
+    try {
+        $resume = '"' + $env:FLIP_BAT + '" resume'
+        Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'FlipperOneDemoResume' -Value $resume -Force
+    } catch { }
+    Write-Host ''
+    Write-Host 'Windows needs one restart to finish enabling WSL.' -ForegroundColor Green
+    Write-Host 'After you sign in again, this helper continues automatically.' -ForegroundColor Green
+    Write-Host 'If it does not, simply double-click this file again.' -ForegroundColor Green
+    Pause-Close
+    exit 0
+}
+
+function Ensure-Distro {
+    if (Test-DistroHealthy) { return $true }
+    if (Test-Distro) {
+        Say 'Repairing the private Linux environment ...'
+        & wsl.exe --terminate $Distro *> $null
+        Start-Sleep -Seconds 1
+        & wsl.exe --unregister $Distro *> $null
+    }
+    $tar = Join-Path $DlDir 'ubuntu-rootfs.tar.gz'
+    Say 'Downloading the Ubuntu base system (about 350 MB) ...'
+    $null = Get-File (Resolve-UbuntuUrls) $tar
+    New-Item -ItemType Directory -Force -Path $DistroDir | Out-Null
+    Say 'Creating the private Linux environment (your other WSL distributions are not touched) ...'
+    & wsl.exe --import $Distro $DistroDir $tar --version 2 *> $null
+    if ($LASTEXITCODE -ne 0) {
+        & wsl.exe --set-default-version 2 *> $null
+        & wsl.exe --import $Distro $DistroDir $tar --version 2 *> $null
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Fail 'The Linux environment could not be created. Make sure virtualization is enabled in your BIOS/UEFI and try again.'
+    }
+    Remove-Item $tar -Force -ErrorAction SilentlyContinue
+    Say 'The Linux environment is ready.'
+    return $true
+}
+
+function Get-Zstd {
+    $exe = Join-Path $ToolsDir 'zstd\zstd.exe'
+    if (Test-Path $exe) { return $exe }
+    $zip = Join-Path $DlDir 'zstd-win64.zip'
+    $null = Get-File @($ZstdUrl) $zip
+    $tmp = Join-Path $ToolsDir 'zstd-tmp'
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Say 'Unpacking the zstd tool ...'
+    try { Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force } catch { Fail "The zstd tool could not be unpacked: $($_.Exception.Message)" }
+    $found = Get-ChildItem -Path $tmp -Recurse -Filter 'zstd.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { Fail 'The zstd download did not contain zstd.exe.' }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $exe) | Out-Null
+    Copy-Item -Path (Join-Path $found.Directory.FullName '*') -Destination (Split-Path -Parent $exe) -Recurse -Force
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    return $exe
+}
+
+function Ensure-RawImage {
+    if ((Test-Path $RealRaw) -and ((Get-Item $RealRaw).Length -gt 5GB)) { return $true }
+    if (Test-Path $RealRaw) { Remove-Item $RealRaw -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path $DlDir, $RealRoot | Out-Null
+    $zst = Join-Path $DlDir 'flipper-os.img.zst'
+    if (-not ((Test-Path $zst) -and ((Get-Item $zst).Length -gt 100MB))) {
+        Assert-Space 10 'Downloading and unpacking the Flipper OS image'
+        $null = Get-File @($ImageUrl) $zst
+    }
+    $zstd = Get-Zstd
+    Assert-Space 7 'Unpacking the Flipper OS image'
+    Say 'Unpacking the Flipper OS image (about 6 GB, this can take a few minutes) ...'
+    $part = "$RealRaw.part"
+    Remove-Item $part -Force -ErrorAction SilentlyContinue
+    & $zstd -d -f --long=31 $zst -o $part
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $part)) {
+        Remove-Item $part -Force -ErrorAction SilentlyContinue
+        Fail 'The Flipper OS image could not be unpacked.'
+    }
+    Move-Item -LiteralPath $part -Destination $RealRaw -Force
+    if ((Get-Item $RealRaw).Length -lt 5GB) {
+        Remove-Item $RealRaw -Force -ErrorAction SilentlyContinue
+        Fail 'The unpacked Flipper OS image is incomplete. Please try again.'
+    }
+    Remove-Item $GuestNetFlag -Force -ErrorAction SilentlyContinue
+    Remove-Item $zst -Force -ErrorAction SilentlyContinue
+    Say 'The Flipper OS image is ready.'
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# QEMU (portable, no administrator rights)
+# ---------------------------------------------------------------------------
+function Find-SystemQemu {
+    $cmd = Get-Command 'qemu-system-aarch64.exe' -ErrorAction SilentlyContinue
+    if (-not $cmd) { $cmd = Get-Command 'qemu-system-aarch64' -ErrorAction SilentlyContinue }
+    if ($cmd) { return $cmd.Source }
+    foreach ($c in @(
+        "$env:ProgramFiles\qemu\qemu-system-aarch64.exe",
+        "${env:ProgramFiles(x86)}\qemu\qemu-system-aarch64.exe",
+        "$env:LOCALAPPDATA\Programs\qemu\qemu-system-aarch64.exe"
+    )) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
+function Get-QemuPath {
+    if (Test-Path $QemuExe) { return $QemuExe }
+    return (Find-SystemQemu)
+}
+
+function Resolve-QemuUrls {
+    $urls = New-Object System.Collections.ArrayList
+    try {
+        $html = (Invoke-WebRequest -Uri $QemuIndex -UseBasicParsing -TimeoutSec 20).Content
+        $names = [regex]::Matches($html, 'href="(qemu-w64-setup-\d+\.exe)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Descending -Unique | Select-Object -First 3
+        foreach ($n in $names) { [void]$urls.Add($QemuIndex + $n) }
+    } catch { }
+    foreach ($n in $QemuFallbacks) {
+        $u = $QemuIndex + $n
+        if (-not $urls.Contains($u)) { [void]$urls.Add($u) }
+    }
+    return , $urls.ToArray()
+}
+
+function Test-QemuChecksum($url, $file) {
+    try {
+        $r = Invoke-WebRequest -Uri ($url + '.sha512') -UseBasicParsing -TimeoutSec 20
+        $text = ([string]$r.Content).Trim()
+        $expected = ''
+        if ($text -match '^\d+(\s+\d+)+$') {
+            $chars = @()
+            foreach ($n in ($text -split '\s+')) {
+                if ($n -match '^\d+$') { $chars += [char][int]$n }
+            }
+            $expected = (-join $chars).Trim()
+        } else {
+            $expected = ($text -split '\s+')[0]
+        }
+        if ($expected -notmatch '^[0-9a-fA-F]{128}$') { return $true }
+        $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA512).Hash
+        return ($actual -ieq $expected)
+    } catch {
+        return $true
+    }
+}
+
+function Get-7z {
+    $exe = Join-Path $ToolsDir '7zip\7z.exe'
+    if (Test-Path $exe) { return $exe }
+    $msi = Join-Path $DlDir '7z-x64.msi'
+    $null = Get-File @($SevenZipMsiUrl) $msi
+    $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+    if ($hash -ne $SevenZipMsiSha256) {
+        Remove-Item $msi -Force -ErrorAction SilentlyContinue
+        Fail 'The 7-Zip download failed its security check. Please try again.'
+    }
+    $admin = Join-Path $ToolsDir '7z-admin'
+    Remove-Item $admin -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $admin | Out-Null
+    Say 'Preparing the unpacking tool ...'
+    $msiArgs = @('/a', ('"' + $msi + '"'), '/qn', ('TARGETDIR="' + $admin + '"'))
+    $null = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru
+    $found = Get-ChildItem -Path $admin -Recurse -Filter '7z.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) { Fail 'The unpacking tool could not be prepared.' }
+    $dst = Split-Path -Parent $exe
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item -Path (Join-Path $found.Directory.FullName '*') -Destination $dst -Recurse -Force
+    Remove-Item $admin -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+    return $exe
+}
+
+function Install-QemuPortable {
+    if (Test-Path $QemuExe) { return $true }
+    Assert-Space 4 'QEMU'
+    Say 'QEMU is required for the real Flipper OS.'
+    Say 'Downloading the portable QEMU emulator (about 200 MB) ...'
+    $setup = Join-Path $DlDir 'qemu-w64-setup.exe'
+    $got = $false
+    foreach ($u in (Resolve-QemuUrls)) {
+        if (-not (Get-File @($u) $setup $true)) { continue }
+        if (Test-QemuChecksum $u $setup) { $got = $true; break }
+        Remove-Item $setup -Force -ErrorAction SilentlyContinue
+        Warn 'The QEMU download was damaged (checksum mismatch). Trying another mirror ...'
+    }
+    if (-not $got) {
+        if (Find-SystemQemu) {
+            Warn 'The automatic QEMU download failed. The QEMU already installed on this PC will be used.'
+            return $true
+        }
+        Fail 'QEMU could not be downloaded. Please check your internet connection and try option 2 again.'
+    }
+    $seven = Get-7z
+    $tmp = Join-Path $Root 'qemu-tmp'
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Say 'Unpacking QEMU (about 1.2 GB, please wait) ...'
+    & $seven x $setup ("-o" + $tmp) -y -bso0 -bsp0
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        Fail 'QEMU could not be unpacked.'
+    }
+    $found = Get-ChildItem -Path $tmp -Recurse -Filter 'qemu-system-aarch64.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $found) {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        Fail 'The QEMU download did not contain the emulator.'
+    }
+    Remove-Item (Join-Path $tmp '$PLUGINSDIR') -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $QemuDir) { Remove-Item $QemuDir -Recurse -Force -ErrorAction SilentlyContinue }
+    $src = $found.Directory.FullName
+    if ([IO.Path]::GetFullPath($src).TrimEnd('\') -eq [IO.Path]::GetFullPath($tmp).TrimEnd('\')) {
+        Move-Item -LiteralPath $tmp -Destination $QemuDir -Force
+    } else {
+        Move-Item -LiteralPath $src -Destination $QemuDir -Force
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item $setup -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $QemuExe)) { Fail 'QEMU could not be prepared.' }
+    Say 'QEMU is ready.'
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# Browser / shortcuts
+# ---------------------------------------------------------------------------
+function Find-Browser {
+    $pf86 = ${env:ProgramFiles(x86)}
+    $c = @(
+        "$pf86\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "$pf86\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+    )
+    foreach ($p in $c) { if ($p -and (Test-Path $p)) { return $p } }
+    return $null
+}
+
+function Get-DeviceProcs {
+    Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*FlipperOneDemo*device-profile*' }
+}
+
+function New-DemoShortcuts {
+    try {
+        $self = Join-Path $Root 'Flipper-One-Demo.bat'
+        New-Item -ItemType Directory -Force -Path $Root | Out-Null
+        if ($script:SelfSource -and (Test-Path -LiteralPath $script:SelfSource)) {
+            $same = $false
+            try { $same = ([IO.Path]::GetFullPath($script:SelfSource) -eq [IO.Path]::GetFullPath($self)) } catch { $same = $false }
+            if (-not $same) { Copy-Item -LiteralPath $script:SelfSource -Destination $self -Force -ErrorAction SilentlyContinue }
+        }
+        if (-not (Test-Path $self)) { return }
+        New-Item -ItemType Directory -Force -Path $MenuDir | Out-Null
+        $ws = New-Object -ComObject WScript.Shell
+        foreach ($item in @(
+            @('Flipper One Demo', ''),
+            @('Start FlipCTL Preview', 'start'),
+            @('Start Real Flipper OS', 'real'),
+            @('Open File Manager', 'files'),
+            @('Open PC File Backup', 'backup'),
+            @('Stop Flipper One', 'stop')
+        )) {
+            $lnk = $ws.CreateShortcut((Join-Path $MenuDir ($item[0] + '.lnk')))
+            $lnk.TargetPath = $self
+            $lnk.Arguments = $item[1]
+            $lnk.WorkingDirectory = $Root
+            $lnk.Save()
+        }
+        $old = Join-Path $MenuDir 'Start Flipper One.lnk'
+        if (Test-Path $old) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
+    } catch { Warn 'Could not create the Start menu shortcuts.' }
+}
+
+function Update-InstalledFlag {
+    if (-not (Test-Path $InstalledFlag)) { return }
+    $installed = ''
+    foreach ($line in (Get-Content -LiteralPath $InstalledFlag -ErrorAction SilentlyContinue)) {
+        if ($line -match '^installed=(.+)$') { $installed = $Matches[1].Trim(); break }
+    }
+    if (-not $installed) { $installed = (Get-Date).ToString('u') }
+    try {
+        Set-Content -Path $InstalledFlag -Value ("installed=$installed`r`nversion=$Version") -Encoding ASCII -ErrorAction Stop
+    } catch { }
+}
+
+function Install-All {
+    New-Item -ItemType Directory -Force -Path $DlDir, $DistroDir, $ToolsDir, $RealRoot, $BootDir | Out-Null
+    $need = 12
+    if ((Test-Path $RealRaw) -and ((Get-Item $RealRaw).Length -gt 5GB)) { $need = 5 }
+    Assert-Space $need 'The installation'
+    $null = Ensure-Wsl
+    $null = Ensure-Distro
+    $null = Ensure-RawImage
+    $node = Join-Path $DlDir 'node.tar.xz'
+    $haveNode = Get-File $NodeUrls $node $true
+    if (-not $haveNode) { Warn 'The Node.js download failed. The Ubuntu package will be used instead.' }
+    $sh = Join-Path $DlDir 'install.sh'
+    [IO.File]::WriteAllText($sh, ($InstallScript -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    Say 'Preparing the preview UI inside the Linux environment (this takes a few minutes) ...'
+    $installArgs = @('-d', $Distro, '-u', 'root', '--exec', '/bin/bash', (ConvertTo-WslPath $sh), (ConvertTo-WslPath $RealRaw), (ConvertTo-WslPath $BootDir))
+    if ($haveNode) { $installArgs += (ConvertTo-WslPath $node) }
+    & wsl.exe @installArgs
+    if ($LASTEXITCODE -ne 0) {
+        Fail 'The setup inside the Linux environment failed. Please copy the messages above when asking for help.'
+    }
+    Set-Content -Path $InstalledFlag -Value ("installed=" + (Get-Date).ToString('u') + "`r`nversion=$Version") -Encoding ASCII
+    New-DemoShortcuts
+    Remove-Item $node -Force -ErrorAction SilentlyContinue
+    Say 'Installation finished.'
+}
+
+# ---------------------------------------------------------------------------
+# Start / stop / uninstall
+# ---------------------------------------------------------------------------
+function Stop-RealOS {
+    param([switch]$Quiet)
+    $stopped = $false
+    if (Test-Path $QemuPidFile) {
+        $qp = [string](Get-Content $QemuPidFile -ErrorAction SilentlyContinue)
+        if ($qp -match '^\d+$') {
+            $proc = Get-Process -Id ([int]$qp) -ErrorAction SilentlyContinue
+            if ($proc) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; $stopped = $true }
+        }
+        Remove-Item $QemuPidFile -Force -ErrorAction SilentlyContinue
+    }
+    Get-CimInstance Win32_Process -Filter "Name='qemu-system-aarch64.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like '*flipper-os.img*' } |
+        ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            $stopped = $true
+        }
+    if ($stopped -and -not $Quiet) { Say 'The real Flipper OS has been stopped.' }
+}
+
+function Stop-Demo {
+    param([switch]$Quiet)
+    if (-not $Quiet) { Say 'Stopping everything ...' }
+    Get-DeviceProcs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $ServerPidFile) {
+        $sp = [string](Get-Content $ServerPidFile -ErrorAction SilentlyContinue)
+        if ($sp -match '^\d+$') { Stop-Process -Id ([int]$sp) -Force -ErrorAction SilentlyContinue }
+        Remove-Item $ServerPidFile -Force -ErrorAction SilentlyContinue
+    }
+    Stop-RealOS -Quiet
+    & wsl.exe --terminate $Distro *> $null
+    if (-not $Quiet) { Say 'Stopped.' }
+}
+
+function Get-RunState {
+    if (Test-Path $QemuPidFile) {
+        $qp = [string](Get-Content $QemuPidFile -ErrorAction SilentlyContinue)
+        if ($qp -match '^\d+$' -and (Get-Process -Id ([int]$qp) -ErrorAction SilentlyContinue)) { return 'real Flipper OS running' }
+    }
+    $q = Get-CimInstance Win32_Process -Filter "Name='qemu-system-aarch64.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like '*flipper-os.img*' } | Select-Object -First 1
+    if ($q) { return 'real Flipper OS running' }
+    if (Test-Server) { return 'FlipCTL preview running' }
+    return 'stopped'
+}
+
+function Start-Demo {
+    if (-not ((Test-Path $InstalledFlag) -and (Test-DistroHealthy))) { Install-All }
+    if (-not (Test-Path $InstalledFlag)) { Fail 'The installation is incomplete. Please choose Reinstall (6).' }
+    Stop-RealOS -Quiet
+    if (-not (Test-Server)) {
+        if (-not (Test-PortFree $Port)) {
+            Say 'Port 8899 is busy. Stopping the previous session ...'
+            Stop-Demo
+            Start-Sleep -Seconds 2
+        }
+        if (-not (Test-PortFree $Port)) {
+            Fail "Port $Port is used by another program. Please close it and try again."
+        }
+        Say 'Starting the FlipCTL preview server ...'
+        $guardJs = "process.on('uncaughtException', function (e) { console.error('[guard] uncaughtException: ' + (e && e.stack ? e.stack : e)); });`nprocess.on('unhandledRejection', function (e) { console.error('[guard] unhandledRejection: ' + (e && e.stack ? e.stack : e)); });`n"
+        $guardFile = Join-Path $Root 'guard.js'
+        [IO.File]::WriteAllText($guardFile, $guardJs, (New-Object System.Text.UTF8Encoding($false)))
+        $q = [string][char]39
+        $wslArgs = '-d ' + $Distro + ' -u root --cd /flipperone-testing/fake-flipctl2 --exec /bin/sh -c "while true; do /opt/node/bin/node --require ' + $q + (ConvertTo-WslPath $guardFile) + $q + ' server.js >> /var/log/flipctl.log 2>&1; sleep 3; done"'
+        $p = Start-Process wsl.exe -ArgumentList $wslArgs -WindowStyle Hidden -PassThru
+        Set-Content -Path $ServerPidFile -Value $p.Id
+        $ok = $false
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 90) {
+            if (Test-Server) { $ok = $true; break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $ok) {
+            Warn ('The preview server is not responding (' + $script:LastErr + ').')
+            Show-Log
+            return
+        }
+    }
+    New-DemoShortcuts
+    Update-InstalledFlag
+    $b = Find-Browser
+    if (-not $b) {
+        Warn 'Neither Edge nor Chrome was found. The page will open in your default browser, but the device preview may not render correctly.'
+    } elseif (-not (Get-DeviceProcs)) {
+        Say 'Starting the invisible device browser ...'
+        $devProfile = Join-Path $Root 'device-profile'
+        $bargs = '--headless=new --disable-gpu --no-first-run --no-default-browser-check ' +
+                 '--log-level=3 --disable-extensions --disable-sync --disable-component-update --disable-background-networking ' +
+                 '--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows ' +
+                 '--user-data-dir="' + $devProfile + '" --user-agent="' + $DeviceUA + '" ' + $Url
+        Start-Process $b -ArgumentList $bargs -WindowStyle Hidden -RedirectStandardOutput (Join-Path $Root 'device.out.log') -RedirectStandardError (Join-Path $Root 'device.err.log') | Out-Null
+        Start-Sleep -Seconds 3
+    }
+    Start-Process $Url
+    Write-Host ''
+    Write-Host "Flipper One is running at $Url" -ForegroundColor Green
+    Write-Host 'It keeps running in the background, even if you close this window.'
+    Write-Host 'To stop it later: Start menu > "Flipper One Demo" > "Stop Flipper One",'
+    Write-Host 'or run this file again and choose 4 (Stop).'
+    Write-Host ''
+    $c = Read-Host 'Type S and press Enter to stop it now, or just press Enter to close this window'
+    if ($c -match '^\s*[sS]') { Stop-Demo; Start-Sleep -Seconds 2 }
+}
+
+function Show-Log {
+    Write-Host ''
+    if (-not (Test-Distro)) {
+        Warn 'The preview has not been installed yet.'
+        Pause-Close
+        return
+    }
+    Write-Host '--- Last lines of the preview server log ---' -ForegroundColor Yellow
+    & wsl.exe -d $Distro -u root --exec /usr/bin/tail -n 80 /var/log/flipctl.log
+    Write-Host '--- End ---' -ForegroundColor Yellow
+    Pause-Close
+}
+
+function Uninstall-All {
+    param([switch]$NoConfirm, [switch]$KeepBackup)
+    if (-not $NoConfirm) {
+        Write-Host ''
+        Write-Host 'This removes ALL of the following:' -ForegroundColor Yellow
+        Write-Host '  - the private Linux environment (FlipperOne)'
+        Write-Host '  - all downloaded Flipper OS files and the portable emulator'
+        Write-Host '  - the Start menu shortcuts and settings'
+        Write-Host ''
+        Write-Host 'Your File Manager files are copied to the PC backup first.' -ForegroundColor Green
+        $a = Read-Host 'Type YES to remove everything'
+        if ($a -ne 'YES') { Say 'Uninstall cancelled.'; return $false }
+    }
+    if ((Test-Path $ShelfFlag) -and (Test-Path $RealRaw)) {
+        Write-Host 'Saving the latest File Manager files to this PC first ...' -ForegroundColor Yellow
+        Stop-RealOS -Quiet
+        Start-Sleep -Seconds 2
+        if (-not (Sync-GuestFiles -Mode Export)) {
+            Warn 'The latest files could not be copied. The existing PC backup is kept.'
+        }
+    }
+    Say 'Removing everything ...'
+    $runningBat = ''
+    $runningFromRoot = $false
+    if ($env:FLIP_BAT -and (Test-Path -LiteralPath $env:FLIP_BAT)) {
+        $runningBat = [IO.Path]::GetFullPath($env:FLIP_BAT)
+        $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+        $runningFromRoot = $runningBat.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)
+        if ($runningFromRoot) {
+            $script:SelfBackup = Join-Path $env:TEMP ('FlipperOneDemo-' + $Version + '.bat')
+            Copy-Item -LiteralPath $runningBat -Destination $script:SelfBackup -Force -ErrorAction SilentlyContinue
+            $script:SelfSource = $script:SelfBackup
+        }
+    }
+    Stop-Demo
+    Stop-RealOS -Quiet
+    try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'FlipperOneDemoResume' -Force -ErrorAction SilentlyContinue } catch { }
+    if (Test-Distro) {
+        & wsl.exe --terminate $Distro *> $null
+        Start-Sleep -Seconds 1
+        & wsl.exe --unregister $Distro *> $null
+        if (Test-Distro) {
+            Start-Sleep -Seconds 2
+            & wsl.exe --unregister $Distro *> $null
+        }
+    }
+    if (Test-Path $MenuDir) { Remove-Item -LiteralPath $MenuDir -Recurse -Force -ErrorAction SilentlyContinue }
+    $scheduled = $false
+    if (Test-Path $Root) {
+        if ($runningFromRoot -and -not $KeepBackup) {
+            Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue |
+                Where-Object { [IO.Path]::GetFullPath($_.FullName) -ne $runningBat } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            $cleanup = 'ping 127.0.0.1 -n 16 >nul & rmdir /s /q "' + $Root + '"'
+            Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $cleanup) -WindowStyle Hidden | Out-Null
+            $scheduled = $true
+        } elseif ($runningFromRoot) {
+            Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue |
+                Where-Object { [IO.Path]::GetFullPath($_.FullName) -ne $runningBat } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            for ($i = 0; $i -lt 10; $i++) {
+                Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path $Root)) { break }
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+    if (-not $KeepBackup -and $script:SelfBackup -and (Test-Path $script:SelfBackup)) {
+        Remove-Item $script:SelfBackup -Force -ErrorAction SilentlyContinue
+        $script:SelfBackup = $null
+    }
+    $distroLeft = Test-Distro
+    $rootLeft = (Test-Path $Root) -and -not $scheduled
+    if ($rootLeft -and $runningFromRoot -and $KeepBackup) {
+        $left = Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue |
+            Where-Object { [IO.Path]::GetFullPath($_.FullName) -ne $runningBat }
+        $rootLeft = [bool]$left
+    }
+    if ($rootLeft) {
+        Warn "Some files could not be removed: $Root"
+        Write-Host 'Please close all browser windows and try option 5 again.' -ForegroundColor Yellow
+        return $false
+    }
+    if ($distroLeft) {
+        Warn 'The private Linux environment could not be removed. Please restart Windows and try option 5 again.'
+        return $false
+    }
+    if ($scheduled) {
+        Say 'Everything has been removed. The last temporary file is cleaned up when this window closes.'
+    } else {
+        Say 'Everything has been removed.'
+    }
+    return $true
+}
+
+function Reinstall-All {
+    $hadReal = Test-Path (Join-Path $RealRoot 'used.flag')
+    Write-Host ''
+    Write-Host 'Reinstall removes everything and downloads a fresh copy.' -ForegroundColor Yellow
+    Write-Host 'This needs an internet connection and several GB of free space.' -ForegroundColor Yellow
+    $a = Read-Host 'Type YES to reinstall'
+    if ($a -ne 'YES') { Say 'Reinstall cancelled.'; return }
+    if (-not (Uninstall-All -NoConfirm -KeepBackup)) { return }
+    Install-All
+    if ($script:SelfBackup -and (Test-Path $script:SelfBackup)) {
+        Remove-Item $script:SelfBackup -Force -ErrorAction SilentlyContinue
+        $script:SelfBackup = $null
+        $script:SelfSource = Join-Path $Root 'Flipper-One-Demo.bat'
+    }
+    if ($hadReal) {
+        $null = Sync-GuestFiles -Mode Import
+        if (-not (Get-QemuPath)) { $null = Install-QemuPortable }
+        Start-RealOS
+    } else {
+        Start-Demo
+    }
+}
+
+# ---------------------------------------------------------------------------
+# File Manager helpers
+# ---------------------------------------------------------------------------
+function Read-ShelfPort {
+    if (Test-Path $ShelfPortFile) {
+        $p = [string](Get-Content -LiteralPath $ShelfPortFile -ErrorAction SilentlyContinue)
+        if ($p -match '^\d+$') { return [int]$p }
+    }
+    return $ShelfPort
+}
+
+function Read-AppPort {
+    if (Test-Path $AppPortFile) {
+        $p = [string](Get-Content -LiteralPath $AppPortFile -ErrorAction SilentlyContinue)
+        if ($p -match '^\d+$') { return [int]$p }
+    }
+    return $Port
+}
+
+function Test-ShelfHttp {
+    param([int]$ShelfPortToTest = 0)
+    if ($ShelfPortToTest -le 0) { $ShelfPortToTest = Read-ShelfPort }
+    if ($ShelfPortToTest -le 0) { return $false }
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$ShelfPortToTest/api/status" -UseBasicParsing -TimeoutSec 4
+        return ($r.StatusCode -eq 200 -and $r.Content -match '"ok"\s*:\s*true')
+    } catch { return $false }
+}
+
+function Select-FreeShelfPort {
+    for ($p = $ShelfPort; $p -le ($ShelfPort + 9); $p++) {
+        if ($p -eq $Port) { continue }
+        if (Test-PortFree $p) { return $p }
+    }
+    Fail 'No free local port was found for the File Manager. Please close other programs and try again.'
+}
+
+function Write-ShelfSources {
+    $dir = Join-Path $RealRoot 'shelf'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $py = Join-Path $dir 'files-shelf.py'
+    $html = Join-Path $dir 'files-shelf.html'
+    $unit = Join-Path $dir 'files-shelf.service'
+    [IO.File]::WriteAllText($py, ($ShelfPython -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($html, ($ShelfHtml -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($unit, ($ShelfUnit -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    return @($py, $html, $unit)
+}
+
+function Set-GuestShelf {
+    param([switch]$Force)
+    if (-not $Force -and (Test-Path $ShelfFlag)) {
+        $flagText = [string](Get-Content -LiteralPath $ShelfFlag -ErrorAction SilentlyContinue)
+        if ($flagText -match ('version=' + [regex]::Escape($Version))) { return 'skipped' }
+    }
+    if (-not (Test-Path $RealRaw)) { return 'failed' }
+    if (-not (Test-DistroHealthy)) {
+        $null = Ensure-Wsl
+        $null = Ensure-Distro
+    }
+    $sources = Write-ShelfSources
+    $sh = Join-Path $RealRoot 'set-shelf.sh'
+    [IO.File]::WriteAllText($sh, ($GuestShelfScript -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    Say 'Preparing the File Manager inside the Flipper OS (one time, about 10 seconds) ...'
+    Say 'Your apps and files are kept.'
+    & wsl.exe -d $Distro -u root --exec /bin/bash (ConvertTo-WslPath $sh) (ConvertTo-WslPath $RealRaw) (ConvertTo-WslPath $sources[0]) (ConvertTo-WslPath $sources[1]) (ConvertTo-WslPath $sources[2]) | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Warn 'The File Manager could not be added to the image.'
+        Warn 'The Flipper OS itself is unchanged and will still start.'
+        return 'failed'
+    }
+    Set-Content -Path $ShelfFlag -Value ("patched=" + (Get-Date).ToString('u') + "`r`nversion=$Version") -Encoding ASCII
+    Remove-Item $sh -Force -ErrorAction SilentlyContinue
+    Say 'File Manager is ready.'
+    return 'patched'
+}
+
+function Sync-GuestFiles {
+    param([ValidateSet('Export','Import')][string]$Mode)
+    if (-not (Test-Path $RealRaw)) { return $false }
+    if (-not (Test-DistroHealthy)) { return $false }
+    New-Item -ItemType Directory -Force -Path $FilesMirror | Out-Null
+    $sh = Join-Path $RealRoot 'sync-files.sh'
+    [IO.File]::WriteAllText($sh, ($GuestFilesScript -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    if ($Mode -eq 'Export') { Say 'Backing up your files from the Flipper OS ...' }
+    else { Say 'Restoring your files into the fresh Flipper OS ...' }
+    & wsl.exe -d $Distro -u root --exec /bin/bash (ConvertTo-WslPath $sh) (ConvertTo-WslPath $RealRaw) $Mode (ConvertTo-WslPath $FilesMirror)
+    $ok = ($LASTEXITCODE -eq 0)
+    if (-not $ok) { Warn 'The file backup/restore step did not finish.' }
+    Remove-Item $sh -Force -ErrorAction SilentlyContinue
+    return $ok
+}
+
+function Open-FileShelf {
+    if (-not ((Test-Path $InstalledFlag) -and (Test-DistroHealthy))) { Install-All }
+    if (-not (Test-Path $InstalledFlag)) { Fail 'The installation is incomplete. Please choose Reinstall (6).' }
+    $state = Get-RunState
+    if ($state -like 'real Flipper OS running*') {
+        $sp = Read-ShelfPort
+        if (-not (Test-ShelfHttp -ShelfPortToTest $sp)) {
+            # QEMU may just have started; give the guest service a moment
+            # before offering a restart.
+            Say 'Waiting for the File Manager ...'
+            for ($i = 0; $i -lt 15; $i++) {
+                Start-Sleep -Seconds 2
+                if (Test-ShelfHttp -ShelfPortToTest $sp) { break }
+            }
+        }
+        if (Test-ShelfHttp -ShelfPortToTest $sp) {
+            $ap = Read-AppPort
+            $openUrl = "http://127.0.0.1:$sp/?app=$ap"
+            Start-Process $openUrl
+            Write-Host ''
+            Write-Host "File Manager is open at $openUrl" -ForegroundColor Green
+            Write-Host 'The Flipper OS keeps running. You can upload files and test them right away.'
+            return
+        }
+        Write-Host ''
+        Warn 'The File Manager is not active in this running session.'
+        Write-Host 'This is normal after updating from an older version: the Flipper OS needs one restart to add it.' -ForegroundColor Yellow
+        $a = Read-Host 'Restart the Flipper OS now? Type Y'
+        if ($a -match '^\s*[yY]') {
+            Stop-Demo -Quiet
+            Start-Sleep -Seconds 2
+            Start-RealOS -Shelf -NoPrompt -ForceShelf
+        } else {
+            Write-Host 'Start the Flipper OS again with option 2, then choose option 3.' -ForegroundColor Yellow
+            Pause-Close
+        }
+        return
+    }
+    Say 'The real Flipper OS is not running. Starting it now for the File Manager ...'
+    Start-RealOS -Shelf -NoPrompt
+}
+
+# ---------------------------------------------------------------------------
+# Real Flipper OS via QEMU
+# ---------------------------------------------------------------------------
+function Extract-RealBoot {
+    if ((Test-Path $Vmlinuz) -and (Test-Path $Initrd)) { return $true }
+    if (-not (Test-Path $RealRaw)) { return $false }
+    if (-not (Test-DistroHealthy)) {
+        $null = Ensure-Wsl
+        $null = Ensure-Distro
+    }
+    $sh = Join-Path $RealRoot 'extract-boot.sh'
+    $bash = @'
+#!/bin/bash
+set -Eeuo pipefail
+IMG="$1"
+OUT="$2"
+MNT=/mnt/fliprealboot
+LOOP=""
+cleanup() {
+  set +e
+  umount "$MNT/p" 2>/dev/null || umount -l "$MNT/p" 2>/dev/null
+  [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+  rmdir "$MNT/p" "$MNT" 2>/dev/null
+}
+trap cleanup EXIT
+mkdir -p "$MNT"
+LOOP="$(losetup -fP --show "$IMG")"
+sleep 1
+OK=0
+for p in "${LOOP}"p*; do
+  [ -b "$p" ] || continue
+  mkdir -p "$MNT/p"
+  if mount -o ro,subvolid=5 "$p" "$MNT/p" 2>/dev/null; then
+    if [ -d "$MNT/p/@Minimal" ]; then
+      D="$(ls -1d "$MNT/p/@Minimal/usr/lib/modules/"*/ 2>/dev/null | sort -V | tail -n 1)"
+      if [ -n "$D" ] && [ -f "$D/vmlinuz" ] && [ -f "$D/initrd" ]; then
+        mkdir -p "$OUT"
+        cp -f "$D/vmlinuz" "$OUT/vmlinuz"
+        cp -f "$D/initrd" "$OUT/initrd"
+        OK=1
+        break
+      fi
+    fi
+    umount "$MNT/p" 2>/dev/null || true
+  fi
+done
+[ "$OK" = 1 ]
+'@
+    [IO.File]::WriteAllText($sh, ($bash -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    Say 'Extracting the kernel and initramfs from the Flipper OS image ...'
+    & wsl.exe -d $Distro -u root --exec /bin/bash (ConvertTo-WslPath $sh) (ConvertTo-WslPath $RealRaw) (ConvertTo-WslPath $BootDir)
+    return ((Test-Path $Vmlinuz) -and (Test-Path $Initrd))
+}
+
+function Set-GuestNetwork {
+    param([switch]$Force)
+    if (-not $Force -and (Test-Path $GuestNetFlag)) { return $true }
+    if (-not (Test-Path $RealRaw)) { return $false }
+    if (-not (Test-DistroHealthy)) {
+        $null = Ensure-Wsl
+        $null = Ensure-Distro
+    }
+    $sh = Join-Path $RealRoot 'set-network.sh'
+    [IO.File]::WriteAllText($sh, ($GuestNetScript -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    Say 'Preparing automatic internet access for the Flipper OS (one time, about 10 seconds) ...'
+    Say 'Please keep this window open until this step has finished.'
+    & wsl.exe -d $Distro -u root --exec /bin/bash (ConvertTo-WslPath $sh) (ConvertTo-WslPath $RealRaw)
+    if ($LASTEXITCODE -ne 0) {
+        Warn 'The network profile could not be written to the image.'
+        Warn 'The Flipper OS will still use its built-in DHCP fallback.'
+        return $false
+    }
+    Set-Content -Path $GuestNetFlag -Value ("patched=" + (Get-Date).ToString('u') + "`r`nversion=$Version") -Encoding ASCII
+    Remove-Item $sh -Force -ErrorAction SilentlyContinue
+    Say 'Automatic internet access (NAT) is ready.'
+    return $true
+}
+
+function Test-RealHttp {
+    try {
+        $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 4
+        if ($r.StatusCode -ne 200) { return $false }
+        $js = Invoke-WebRequest -Uri ($Url + 'remote.js') -UseBasicParsing -TimeoutSec 4
+        return ($js.StatusCode -eq 200 -and $js.Content.Length -gt 1000)
+    } catch { return $false }
+}
+
+function Start-RealOS {
+    param([switch]$Shelf, [switch]$NoPrompt, [switch]$ForceShelf)
+    Say '=== Real Flipper OS (experimental) ==='
+    Write-Host ''
+    Write-Host 'Flipper OS is built for Rockchip RK3576 (ARM).' -ForegroundColor Yellow
+    Write-Host 'On a Windows PC it runs in QEMU (aarch64) software emulation.' -ForegroundColor Yellow
+    Write-Host 'Real hardware (Wi-Fi, modem, battery, GPIO) is not available.' -ForegroundColor Yellow
+    Write-Host 'The first start usually takes 1-3 minutes.' -ForegroundColor Yellow
+    Write-Host ''
+    if (-not ((Test-Path $InstalledFlag) -and (Test-DistroHealthy))) { Install-All }
+    New-DemoShortcuts
+    if (-not (Test-Path $RealRaw)) { $null = Ensure-RawImage }
+    if (-not (Extract-RealBoot)) { Fail 'The Flipper OS kernel files are missing. Please choose Reinstall (6).' }
+    if (-not (Get-QemuPath)) {
+        if (-not (Install-QemuPortable)) { Fail 'QEMU is not available.' }
+    }
+    $qemu = Get-QemuPath
+    if (-not $qemu) { Fail 'QEMU is not available.' }
+    Say "QEMU: $qemu"
+    Stop-Demo -Quiet
+    Start-Sleep -Seconds 2
+    # Only back up an image that already has the File Manager. On a fresh
+    # install/reinstall this folder is new, and the mirror must win instead.
+    if (Test-Path $ShelfFlag) { $null = Sync-GuestFiles -Mode Export }
+    $null = Set-GuestNetwork
+    $shelfState = Set-GuestShelf -Force:$ForceShelf
+    if ($shelfState -eq 'patched') {
+        # A fresh image has just received the File Manager. Restore the PC
+        # backup, if there is one, so an uninstall/reinstall keeps user files.
+        $null = Sync-GuestFiles -Mode Import
+    }
+    Update-InstalledFlag
+    $script:Port = Select-FreePort
+    $script:Url = "http://127.0.0.1:$Port/"
+    $script:ShelfPort = Select-FreeShelfPort
+    $script:ShelfUrl = "http://127.0.0.1:$ShelfPort/"
+    Set-Content -Path $AppPortFile -Value $Port -Encoding ASCII
+    Set-Content -Path $ShelfPortFile -Value $ShelfPort -Encoding ASCII
+    Assert-Space 2 'Starting the emulator'
+    $serialLog = Join-Path $RealRoot 'serial.log'
+    $qemuErr = Join-Path $RealRoot 'qemu.err.log'
+    $qemuOut = Join-Path $RealRoot 'qemu.out.log'
+    Remove-Item $serialLog, $qemuErr, $qemuOut -Force -ErrorAction SilentlyContinue
+    $rootUuid = '5cf1bcd6-084c-47d5-aae3-3a82b879366c'
+    $profile = '@Minimal'
+    # QEMU has no Flipper panel/buttons, so logind never creates seat1 and the
+    # PAM session for flipctl fails. Without that session /run/user/1000 does
+    # not exist, and hosted apps cannot get a runtime directory for sway.
+    # Point flipctl at /tmp instead, and make SDL use its software renderer:
+    # the emulated machine has no GPU, and the OpenGL path makes hosted games
+    # (Doom) draw nothing or crash. Both are passed to PID 1, so the flipctl
+    # service and everything it starts inherit them.
+    $append = "root=UUID=$rootUuid rootflags=subvol=$profile rw rootwait console=ttyS0,115200 console=tty0 " +
+              "systemd.setenv=XDG_RUNTIME_DIR=/tmp " +
+              "systemd.setenv=SDL_RENDER_DRIVER=software " +
+              "systemd.setenv=SDL_VIDEODRIVER=wayland"
+    $appendQuoted = '"' + $append + '"'
+    $ramGb = 8
+    try { $ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1GB, 0) } catch { }
+    if ($ramGb -ge 8) { $mem = 4096 } elseif ($ramGb -ge 6) { $mem = 3072 } else { $mem = 2048 }
+    $smp = [math]::Min(4, [math]::Max(1, [Environment]::ProcessorCount))
+    $argsLine = "-M virt -accel tcg -cpu cortex-a72 -m $mem -smp $smp " +
+                "-kernel `"$Vmlinuz`" -initrd `"$Initrd`" -append $appendQuoted " +
+                "-drive `"if=none,file=$RealRaw,format=raw,id=hd0`" -device virtio-blk-device,drive=hd0 " +
+                "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:${Port}-:8899,hostfwd=tcp:127.0.0.1:${ShelfPort}-:8898 -device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56 " +
+                "-display none -no-reboot " +
+                "-chardev `"file,id=ser0,path=$serialLog`" -device pci-serial,chardev=ser0"
+    Say 'Starting QEMU with the real Flipper OS kernel ...'
+    $proc = Start-Process -FilePath $qemu -ArgumentList $argsLine -WindowStyle Hidden -PassThru -RedirectStandardError $qemuErr -RedirectStandardOutput $qemuOut
+    Set-Content -Path $QemuPidFile -Value $proc.Id
+    $ok = $false
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lastReport = -10
+    while ($sw.Elapsed.TotalSeconds -lt 420) {
+        if (Test-RealHttp) { $ok = $true; break }
+        if ($proc.HasExited) { break }
+        $elapsed = [int]$sw.Elapsed.TotalSeconds
+        if ($elapsed - $lastReport -ge 15) {
+            Say "Waiting for Flipper OS ... ${elapsed}s (software emulation is slow)"
+            $lastReport = $elapsed
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $ok) {
+        if ($proc.HasExited) {
+            Warn "QEMU stopped unexpectedly (exit code $($proc.ExitCode))."
+            Remove-Item $QemuPidFile -Force -ErrorAction SilentlyContinue
+            Write-Host "QEMU error log: $qemuErr" -ForegroundColor Yellow
+            if ((Test-Path $qemuErr) -and ((Get-Item $qemuErr).Length -gt 0)) { Get-Content $qemuErr -Tail 30 }
+            if ((Test-Path $serialLog) -and ((Get-Item $serialLog).Length -gt 0)) {
+                Write-Host '--- Last serial output ---' -ForegroundColor Yellow
+                Get-Content $serialLog -Tail 30
+            }
+            Write-Host ''
+            Write-Host 'The image is built for RK3576. If the kernel does not boot here,' -ForegroundColor Yellow
+            Write-Host 'it needs real RK3576 hardware (for example an Armsom Sige5).' -ForegroundColor Yellow
+            Pause-Close
+            return
+        }
+        Warn 'The real Flipper OS is still starting after 7 minutes.'
+        if ($Shelf) {
+            Write-Host "QEMU is still running. You can wait and open ${ShelfUrl}?app=$Port manually." -ForegroundColor Yellow
+        } else {
+            Write-Host "QEMU is still running. You can wait and open $Url manually." -ForegroundColor Yellow
+        }
+        if ($NoPrompt) { return }
+        Write-Host 'Press S and Enter to stop it, or press Enter to leave it running.' -ForegroundColor Yellow
+        $c = Read-Host 'Choice'
+        if ($c -match '^\s*[sS]') { Stop-RealOS; Start-Sleep -Seconds 2 }
+        return
+    }
+    Set-Content -Path (Join-Path $RealRoot 'used.flag') -Value ((Get-Date).ToString('u')) -Encoding ASCII
+    if ($Shelf) {
+        $shelfReady = Test-ShelfHttp -ShelfPortToTest $ShelfPort
+        if (-not $shelfReady) {
+            Say 'Waiting for the File Manager ...'
+            $shelfWait = [Diagnostics.Stopwatch]::StartNew()
+            while ($shelfWait.Elapsed.TotalSeconds -lt 45) {
+                $shelfReady = Test-ShelfHttp -ShelfPortToTest $ShelfPort
+                if ($shelfReady) { break }
+                Start-Sleep -Seconds 2
+            }
+        }
+        if (-not $shelfReady) {
+            Warn 'The File Manager is not answering yet. Refresh the page in a moment.'
+        }
+        $openUrl = "${ShelfUrl}?app=$Port"
+        Start-Process $openUrl
+        Write-Host ''
+        Write-Host "The real Flipper OS is running at $Url" -ForegroundColor Green
+        Write-Host "File Manager: $openUrl" -ForegroundColor Green
+        Write-Host 'Upload files there and test them in the App Manager right away.'
+    } else {
+        Start-Process $Url
+        Write-Host ''
+        Write-Host "The real Flipper OS is running at $Url" -ForegroundColor Green
+        Write-Host 'For your own files, choose option 3 (File Manager) in this menu.'
+    }
+    Write-Host 'It keeps running in the background, even if you close this window.'
+    Write-Host 'To stop it later: Start menu > "Flipper One Demo" > "Stop Flipper One",'
+    Write-Host 'or run this file again and choose 4 (Stop).'
+    if ($NoPrompt) { return }
+    Write-Host ''
+    $c = Read-Host 'Type S and press Enter to stop it now, or just press Enter to close this window'
+    if ($c -match '^\s*[sS]') { Stop-RealOS; Start-Sleep -Seconds 2 }
+}
+
+function Show-Menu {
+    while ($true) {
+        Write-Host ''
+        Write-Host '  [1] FlipCTL preview  (fast, stable)'
+        Write-Host '  [2] Real Flipper OS  (experimental, QEMU emulation)'
+        Write-Host '  [3] File Manager     (your files, works with option 2)'
+        Write-Host '  [4] Stop everything'
+        Write-Host '  [5] Uninstall everything'
+        Write-Host '  [6] Reinstall'
+        Write-Host '  [7] Show server log'
+        Write-Host '  [8] Exit'
+        Write-Host ('  Status: ' + (Get-RunState)) -ForegroundColor DarkGray
+        $c = Read-Host '  Choose an option (Enter = 1)'
+        if ($null -eq $c) { return }
+        $c = $c.Trim()
+        if ($c -eq '') { $c = '1' }
+        if ($c -notmatch '^[1-8]$') { Warn 'Please enter a number from 1 to 8.'; continue }
+        switch ($c) {
+            '1' { Start-Demo; return }
+            '2' { Start-RealOS; return }
+            '3' { Open-FileShelf; return }
+            '4' { Stop-Demo; Start-Sleep -Seconds 2; return }
+            '5' { $null = Uninstall-All; Start-Sleep -Seconds 3; return }
+            '6' { Reinstall-All; return }
+            '7' { Show-Log; return }
+            '8' { return }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+$cmd = ''
+if ($env:FLIP_ARGS) { $cmd = $env:FLIP_ARGS.Trim().ToLower() }
+
+Write-Host ''
+Write-Host "=== Flipper One Demo v$Version ===" -ForegroundColor Yellow
+Write-Host 'Unofficial community helper - not affiliated with Flipper Devices.' -ForegroundColor DarkGray
+Write-Host 'Option 1: FlipCTL preview (fast, stable).'
+Write-Host 'Option 2: real Flipper OS in QEMU (experimental, slow).'
+Write-Host 'Option 3: File Manager for your own files (works with option 2).'
+
+if ($cmd -eq 'stop') { Stop-Demo; Start-Sleep -Seconds 2; exit 0 }
+if ($cmd -eq 'real' -or $cmd -eq 'realos') { Start-RealOS; exit 0 }
+if ($cmd -eq 'files') { Open-FileShelf; exit 0 }
+if ($cmd -eq 'backup') {
+    New-Item -ItemType Directory -Force -Path $FilesMirror | Out-Null
+    Start-Process explorer.exe $FilesMirror
+    exit 0
+}
+if ($cmd -eq 'start') { Start-Demo; exit 0 }
+if ($cmd -eq 'log') { Show-Log; exit 0 }
+if ($cmd -eq 'uninstall') { $null = Uninstall-All -NoConfirm; exit 0 }
+if ($cmd -eq 'qemu') { $null = Install-QemuPortable; Write-Host ('QEMU: ' + (Get-QemuPath)); exit 0 }
+if ($cmd -eq 'install') { Install-All; exit 0 }
+if ($cmd -eq 'reinstall') {
+    $hadReal = Test-Path (Join-Path $RealRoot 'used.flag')
+    if (Uninstall-All -NoConfirm -KeepBackup) {
+        Install-All
+        if ($script:SelfBackup -and (Test-Path $script:SelfBackup)) {
+            Remove-Item $script:SelfBackup -Force -ErrorAction SilentlyContinue
+            $script:SelfBackup = $null
+            $script:SelfSource = Join-Path $Root 'Flipper-One-Demo.bat'
+        }
+        if ($hadReal) {
+            $null = Sync-GuestFiles -Mode Import
+            if (-not (Get-QemuPath)) { $null = Install-QemuPortable }
+            Start-RealOS
+        } else { Start-Demo }
+    }
+    exit 0
+}
+if ($cmd -eq 'resume') {
+    try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'FlipperOneDemoResume' -Force -ErrorAction SilentlyContinue } catch { }
+    Install-All
+    Show-Menu
+    exit 0
+}
+
+if (-not ((Test-Path $InstalledFlag) -and (Test-DistroHealthy))) {
+    Write-Host ''
+    Write-Host 'First start: everything needed is downloaded and set up automatically.' -ForegroundColor Green
+    Write-Host 'This can take a few minutes and needs about 12 GB of free disk space.' -ForegroundColor Green
+    Write-Host 'Option 1 needs no administrator rights. Option 2 uses QEMU (portable if needed).' -ForegroundColor Green
+    Write-Host 'Windows may ask once for permission to enable WSL.' -ForegroundColor Green
+}
+Show-Menu
